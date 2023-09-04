@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Table of Errors</title>
+    <style>
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: Arial, sans-serif;
+        }
+        th, td {
+            padding: 10px;
+            border: 1px solid #ddd;
+        }
+        th {
+            background-color: #f2f2f2;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+        tr:hover {
+            background-color: #ddd;
+        }
+    </style>
+	<button id="toggleAutoUpdate">Отключить автообновление</button>
+    <script>
+        function sortTable(n, table) {
+            let rows, switching, i, x, y, shouldSwitch, dir, switchCount = 0;
+            switching = true;
+            dir = "asc";
+            while (switching) {
+                switching = false;
+                rows = table.rows;
+                for (i = 1; i < rows.length - 1; i++) {
+                    shouldSwitch = false;
+                    x = rows[i].getElementsByTagName("td")[n];
+                    y = rows[i + 1].getElementsByTagName("td")[n];
+                    if (dir == "asc") {
+                        if (x.innerHTML.toLowerCase() > y.innerHTML.toLowerCase()) {
+                            shouldSwitch = true;
+                            break;
+                        }
+                    } else if (dir == "desc") {
+                        if (x.innerHTML.toLowerCase() < y.innerHTML.toLowerCase()) {
+                            shouldSwitch = true;
+                            break;
+                        }
+                    }
+                }
+                if (shouldSwitch) {
+                    rows[i].parentNode.insertBefore(rows[i + 1], rows[i]);
+                    switching = true;
+                    switchCount++;
+                } else {
+                    if (switchCount === 0 && dir == "asc") {
+                        dir = "desc";
+                        switching = true;
+                    }
+                }
+            }
+        }
+
+        function sortTableOnClick(headerIndex) {
+            const table = document.getElementById('dataTable');
+            sortTable(headerIndex, table);
+        }
+
+        function updateTable() {
+            const xhr = new XMLHttpRequest();
+
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState === 4) {
+                    if (xhr.status === 200) {
+                        const response = JSON.parse(xhr.responseText);
+                        const table = document.getElementById('dataTable');
+
+                        // Удаляем все имеющиеся строки из таблицы
+                        while (table.rows.length > 1) {
+                            table.deleteRow(-1);
+                        }
+
+                        // Добавляем новые строки в таблицу
+                        const data = response.data;
+                        for (let i = 0; i < data.length; i++) {
+                            const row = table.insertRow();
+                            const nameCell = row.insertCell(0);
+                            const identCell = row.insertCell(1);
+                            const valueCell = row.insertCell(2);
+                            nameCell.innerHTML = data[i][0];
+                            identCell.innerHTML = data[i][1]['ident'];
+                            valueCell.innerHTML = data[i][1]['value'];
+                        }
+                    }
+                }
+            }
+
+            xhr.open('GET', '/api/data');
+            xhr.send();
+        }
+
+        let autoUpdate = true;
+
+		function toggleAutoUpdate() {
+			autoUpdate = !autoUpdate;
+			const button = document.getElementById('toggleAutoUpdate');
+			if (autoUpdate) {
+				button.textContent = 'Отключить автообновление';
+			} else {
+				button.textContent = 'Включить автообновление';
+			}
+		}
+
+		function updateTableIfAllowed() {
+			if (autoUpdate) {
+				updateTable();
+			}
+		}
+
+		document.getElementById('toggleAutoUpdate').addEventListener('click', toggleAutoUpdate);
+
+		window.onload = function() {
+			updateTable();
+			setInterval(updateTableIfAllowed, 5000); // Обновляем таблицу каждые 5 секунд, если разрешено
+		}
+    </script>
+	<script></script>
+</head>
+<body>
+    <table id="dataTable">
+        <tr>
+            <th onclick="sortTableOnClick(0)">Name</th>
+            <th onclick="sortTableOnClick(1)">Ident</th>
+            <th onclick="sortTableOnClick(2)">Value</th>
+        </tr>
+        <!-- Пустые данные только для отображения таблицы -->
+        <tr>
+            <td colspan="3">No data yet.</td>
+        </tr>
+    </table>
+</body>
+</html>
