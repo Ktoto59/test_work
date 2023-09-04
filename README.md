@@ -2,8 +2,8 @@
 
 для запуска потребуются следующие библиотеки Flask, requests
 
-pip install Flask
-pip install requests
+<p>pip install Flask</p>
+<p>pip install requests</p>
 
 
 Запуск серверной части происходит в приложении test_app.py
