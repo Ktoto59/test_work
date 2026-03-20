@@ -24,7 +24,7 @@ read -p "Enter number [1-8]: " TUNNEL
 
 if [ "$TUNNEL" = "1" ]; then
     echo "Configuring WireGuard..."
-    apk add --no-cache wireguard-tools iproute2
+    apk add --no-cache wireguard-tools
 
     read -p "Enter private key: " WG_PRIV
     read -p "Enter internal IP with subnet (e.g. 10.8.0.3/24): " WG_IP
