@@ -94,6 +94,6 @@ chmod +x /etc/init.d/getdomains
 /etc/init.d/getdomains start
 
 echo "Restarting network..."
-rc-service network restart || systemctl restart network
+service network restart
 
 echo "Setup complete."
