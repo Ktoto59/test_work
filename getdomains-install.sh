@@ -1,422 +1,407 @@
 #!/bin/sh
+# OpenWrt 25.x / 24.x
+# WireGuard + russia_inside domain routing + forced DNS hijack + DoH upstream
+#
+# What it does:
+# 1) Forces all LAN clients' DNS (TCP/UDP 53) to the router
+# 2) Runs dnsmasq as local DNS on 53
+# 3) Sends dnsmasq upstream DNS to local DoH proxy on 127.0.0.1:5053
+# 4) Downloads russia_inside domain list
+# 5) Adds domains to dnsmasq ipset/nftset tagging
+# 6) Marks packets to those resolved IPs and routes them via WireGuard
+#
+# IMPORTANT:
+# - Requires firewall4/nftables-compatible OpenWrt (modern OpenWrt)
+# - Uses ipset UCI sections because dnsmasq/firewall UCI on OpenWrt handles translation
+# - If your build has dnsmasq-full already, good. If not, it installs it.
+#
+# Author: v3 for user case "provider hijacks port 53"
 
-set -eu
-
-BASE_DIR="/etc/hivpn"
-BIN_SCRIPT="/usr/bin/getdomains-wg"
-INIT_SCRIPT="/etc/init.d/getdomains-wg"
-HOTPLUG_SCRIPT="/etc/hotplug.d/iface/95-getdomains-wg"
-DOMAINS_FILE="$BASE_DIR/domains.lst"
-CRON_FILE="/etc/crontabs/root"
+set -e
 
 WG_IF="wg0"
-NFT_FAMILY="inet"
-NFT_TABLE="fw4"
-NFT_SET4="vpn_domains"
-FWMARK_HEX="0x1"
-ROUTE_TABLE="100"
-ROUTE_PRIORITY="10000"
+ROUTE_TABLE_NAME="vpn"
+ROUTE_TABLE_ID="99"
 
-GETDOMAINS_URL="https://raw.githubusercontent.com/Ktoto59/test_work/refs/heads/main/getdomains-install.sh"
+IPSET_NAME="vpn_domains"
 
-GREEN="\033[32;1m"
-RED="\033[31;1m"
-BLUE="\033[34;1m"
-YELLOW="\033[33;1m"
-RESET="\033[0m"
+# Source list for russia_inside (Antifilter)
+# If this URL dies, replace it with your known-good source.
+DOMAINS_URL="https://antifilter.download/list/domains.lst"
 
-ok() {
-    printf "${GREEN}[✓] %s${RESET}\n" "$1"
+DOMAINS_RAW="/tmp/${IPSET_NAME}_raw.lst"
+DOMAINS_CLEAN="/tmp/${IPSET_NAME}_clean.lst"
+
+DOH_SECTION="cloudflare"
+DOH_LISTEN_ADDR="127.0.0.1"
+DOH_LISTEN_PORT="5053"
+
+# Cloudflare DoH by default (change if needed)
+DOH_BOOTSTRAP_DNS="1.1.1.1,1.0.0.1"
+DOH_RESOLVER_URL="https://cloudflare-dns.com/dns-query"
+
+LAN_IF="br-lan"
+MARK_HEX="0x1"
+
+# ---------- helpers ----------
+
+log() {
+    echo "[*] $*"
 }
 
 warn() {
-    printf "${YELLOW}[!] %s${RESET}\n" "$1"
+    echo "[!] $*" >&2
 }
 
-err() {
-    printf "${RED}[x] %s${RESET}\n" "$1"
+have_pkg() {
+    opkg list-installed | grep -q "^$1 "
 }
 
-info() {
-    printf "${BLUE}[*] %s${RESET}\n" "$1"
+ensure_pkg() {
+    if ! have_pkg "$1"; then
+        log "Installing package: $1"
+        opkg update
+        opkg install "$1"
+    else
+        log "Package already installed: $1"
+    fi
 }
 
-die() {
-    err "$1"
-    exit 1
+uci_commit_if_changed() {
+    uci commit "$1"
 }
 
-cmd_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
+delete_all_matching_uci_sections() {
+    # $1=config name, $2=section type, $3=grep pattern
+    CFG="$1"
+    TYPE="$2"
+    PATTERN="$3"
 
-ensure_cmd() {
-    cmd_exists "$1" || die "Команда не найдена: $1"
-}
-
-get_wg_uci_iface() {
-    uci show network 2>/dev/null | grep "=interface" | cut -d. -f2 | cut -d= -f1 | while read -r s; do
-        proto="$(uci -q get network."$s".proto || true)"
-        device="$(uci -q get network."$s".device || true)"
-        ifname="$(uci -q get network."$s".ifname || true)"
-        if [ "$proto" = "wireguard" ]; then
-            echo "$s"
-            return 0
-        fi
-        if [ "$device" = "$WG_IF" ] || [ "$ifname" = "$WG_IF" ]; then
-            echo "$s"
-            return 0
+    uci show "$CFG" 2>/dev/null | grep "=$TYPE" | cut -d= -f1 | while read -r SEC; do
+        if uci show "$SEC" 2>/dev/null | grep -q "$PATTERN"; then
+            uci delete "$SEC"
         fi
     done
-    return 1
 }
 
-check_prereqs() {
-    ensure_cmd ip
-    ensure_cmd nft
-    ensure_cmd nslookup
-    ensure_cmd uci
-    ensure_cmd grep
-    ensure_cmd awk
-    ensure_cmd sed
-    ensure_cmd sort
-    ensure_cmd logger
-
-    if ! cmd_exists curl; then
-        warn "curl не найден, ставлю..."
-        opkg update
-        opkg install curl || die "Не удалось установить curl"
-    fi
-
-    if ! ip link show "$WG_IF" >/dev/null 2>&1; then
-        die "Интерфейс $WG_IF не найден. Проверь имя WG интерфейса."
-    fi
-
-    if ip link show "$WG_IF" | grep -q "UP"; then
-        ok "Интерфейс $WG_IF найден и поднят"
+ensure_rt_table() {
+    if ! grep -qE "^[[:space:]]*${ROUTE_TABLE_ID}[[:space:]]+${ROUTE_TABLE_NAME}\$" /etc/iproute2/rt_tables 2>/dev/null; then
+        log "Adding routing table ${ROUTE_TABLE_ID} ${ROUTE_TABLE_NAME}"
+        echo "${ROUTE_TABLE_ID} ${ROUTE_TABLE_NAME}" >> /etc/iproute2/rt_tables
     else
-        warn "Интерфейс $WG_IF найден, но сейчас не UP. Продолжаем."
-    fi
-
-    WG_UCI_IFACE="$(get_wg_uci_iface || true)"
-    if [ -n "${WG_UCI_IFACE:-}" ]; then
-        RAI="$(uci -q get network."$WG_UCI_IFACE".route_allowed_ips || echo 0)"
-        if [ "$RAI" = "1" ]; then
-            die "У интерфейса network.$WG_UCI_IFACE включен route_allowed_ips=1. Это ломает selective routing. Выключи: uci set network.$WG_UCI_IFACE.route_allowed_ips='0'; uci commit network; service network restart"
-        else
-            ok "route_allowed_ips=0 (или не задан) для network.$WG_UCI_IFACE"
-        fi
-    else
-        warn "Не удалось однозначно определить UCI-секцию WireGuard. Проверь route_allowed_ips вручную."
+        log "Routing table exists: ${ROUTE_TABLE_NAME}"
     fi
 }
 
-create_dirs_and_files() {
-    mkdir -p "$BASE_DIR"
-
-    if [ ! -f "$DOMAINS_FILE" ]; then
-        cat > "$DOMAINS_FILE" << 'EOF'
-instagram.com
-facebook.com
-fbcdn.net
-cdninstagram.com
-whatsapp.com
-whatsapp.net
-youtube.com
-googlevideo.com
-ytimg.com
-youtu.be
-EOF
-        ok "Создан список доменов: $DOMAINS_FILE"
-    else
-        ok "Список доменов уже существует: $DOMAINS_FILE"
-    fi
-}
-
-create_getdomains_script() {
-    cat > "$BIN_SCRIPT" << 'EOF'
-#!/bin/sh
-
-DOMAINS_FILE="/etc/hivpn/domains.lst"
-NFT_FAMILY="inet"
-NFT_TABLE="fw4"
-NFT_SET4="vpn_domains"
-
-WG_IF="wg0"
-FWMARK_HEX="0x1"
-ROUTE_TABLE="100"
-ROUTE_PRIORITY="10000"
-
-TMP_FILE="/tmp/getdomains-wg.ips"
-LOCK_FILE="/var/run/getdomains-wg.lock"
-LOG_TAG="getdomains-wg"
-
-log() {
-    logger -t "$LOG_TAG" "$*"
-    echo "$LOG_TAG: $*"
-}
-
-fail() {
-    log "ERROR: $*"
-    exit 1
-}
-
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-require_cmd() {
-    command_exists "$1" || fail "command not found: $1"
-}
-
-resolve_domain_ipv4() {
-    local domain="$1"
-
-    nslookup "$domain" 127.0.0.1 2>/dev/null \
-        | awk '/^Address [0-9]+: / {print $3} /^Address: / {print $2}' \
-        | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
-        | sort -u
-}
-
-ensure_nft_set() {
-    nft list set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET4" >/dev/null 2>&1 && return 0
-
-    nft add set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET4" "{ type ipv4_addr; flags interval; comment \"WG domain routing\"; }" \
-        || fail "failed to create nft set $NFT_SET4"
-}
-
-flush_nft_set() {
-    nft flush set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET4" >/dev/null 2>&1 \
-        || fail "failed to flush nft set $NFT_SET4"
-}
-
-load_ips_to_nft() {
-    local count
-    count="$(wc -l < "$TMP_FILE" | tr -d ' ')"
-    [ -n "$count" ] || count=0
-
-    flush_nft_set
-
-    if [ "$count" -eq 0 ]; then
-        log "no IPs resolved, nft set left empty"
+ensure_wg_config() {
+    if uci -q get network."$WG_IF" >/dev/null 2>&1; then
+        log "WireGuard interface ${WG_IF} already exists in UCI"
         return 0
     fi
 
-    while IFS= read -r ip; do
-        [ -n "$ip" ] || continue
-        nft add element "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET4" "{ $ip }" \
-            || log "failed to add IP $ip"
-    done < "$TMP_FILE"
+    log "WireGuard interface ${WG_IF} not found. Enter config now."
 
-    log "loaded $count IPs into nft set $NFT_SET4"
+    printf "Enter private key: "
+    read -r WG_PRIVATE_KEY
+
+    printf "Enter WG internal IP CIDR (example 10.66.66.2/24): "
+    read -r WG_IP
+
+    printf "Enter peer public key: "
+    read -r WG_PUBLIC_KEY
+
+    printf "Enter peer endpoint host: "
+    read -r WG_ENDPOINT_HOST
+
+    printf "Enter peer endpoint port: "
+    read -r WG_ENDPOINT_PORT
+
+    uci set network."$WG_IF"='interface'
+    uci set network."$WG_IF".proto='wireguard'
+    uci set network."$WG_IF".private_key="$WG_PRIVATE_KEY"
+    uci -q delete network."$WG_IF".addresses
+    uci add_list network."$WG_IF".addresses="$WG_IP"
+
+    uci add network wireguard_"$WG_IF" >/dev/null
+    uci set network.@wireguard_"$WG_IF"[-1].description='wg-peer'
+    uci set network.@wireguard_"$WG_IF"[-1].public_key="$WG_PUBLIC_KEY"
+    uci set network.@wireguard_"$WG_IF"[-1].route_allowed_ips='0'
+    uci add_list network.@wireguard_"$WG_IF"[-1].allowed_ips='0.0.0.0/0'
+    uci add_list network.@wireguard_"$WG_IF"[-1].allowed_ips='::/0'
+    uci set network.@wireguard_"$WG_IF"[-1].endpoint_host="$WG_ENDPOINT_HOST"
+    uci set network.@wireguard_"$WG_IF"[-1].endpoint_port="$WG_ENDPOINT_PORT"
+    uci set network.@wireguard_"$WG_IF"[-1].persistent_keepalive='25'
+
+    uci commit network
+    /etc/init.d/network restart
 }
 
-ensure_mark_rules() {
-    nft list chain inet fw4 mangle_prerouting >/dev/null 2>&1 || fail "chain inet fw4 mangle_prerouting not found"
-    nft list chain inet fw4 mangle_output >/dev/null 2>&1 || fail "chain inet fw4 mangle_output not found"
+ensure_wg_firewall_zone() {
+    if ! uci show firewall 2>/dev/null | grep -q "name='vpn'"; then
+        log "Creating firewall zone: vpn"
 
-    nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -Fq 'comment "wg-domain-routing-prerouting"' || \
-        nft insert rule inet fw4 mangle_prerouting ip daddr @"$NFT_SET4" meta mark set "$FWMARK_HEX" comment "wg-domain-routing-prerouting" || \
-        fail "failed to add prerouting mark rule"
+        uci add firewall zone >/dev/null
+        uci set firewall.@zone[-1].name='vpn'
+        uci add_list firewall.@zone[-1].network="$WG_IF"
+        uci set firewall.@zone[-1].input='REJECT'
+        uci set firewall.@zone[-1].output='ACCEPT'
+        uci set firewall.@zone[-1].forward='REJECT'
+        uci set firewall.@zone[-1].masq='1'
+        uci set firewall.@zone[-1].mtu_fix='1'
 
-    nft list chain inet fw4 mangle_output 2>/dev/null | grep -Fq 'comment "wg-domain-routing-output"' || \
-        nft insert rule inet fw4 mangle_output ip daddr @"$NFT_SET4" meta mark set "$FWMARK_HEX" comment "wg-domain-routing-output" || \
-        fail "failed to add output mark rule"
+        # lan -> vpn forward
+        uci add firewall forwarding >/dev/null
+        uci set firewall.@forwarding[-1].src='lan'
+        uci set firewall.@forwarding[-1].dest='vpn'
+
+        uci commit firewall
+        /etc/init.d/firewall restart
+    else
+        log "Firewall zone vpn already exists"
+    fi
 }
 
-ensure_ip_rule() {
-    ip rule show | grep -q "fwmark 0x1 lookup $ROUTE_TABLE" && return 0
-    ip rule add fwmark "$FWMARK_HEX" table "$ROUTE_TABLE" priority "$ROUTE_PRIORITY" 2>/dev/null || true
+ensure_ipset_section() {
+    # Clean old duplicates
+    delete_all_matching_uci_sections firewall ipset "name='${IPSET_NAME}'"
+
+    log "Creating firewall ipset section: ${IPSET_NAME}"
+    uci add firewall ipset >/dev/null
+    uci set firewall.@ipset[-1].name="${IPSET_NAME}"
+    uci set firewall.@ipset[-1].family='ipv4'
+    uci set firewall.@ipset[-1].match='dst_net'
+    uci commit firewall
 }
 
-ensure_route_table() {
-    ip route show table "$ROUTE_TABLE" | grep -q "^default dev $WG_IF" && return 0
-    ip route del default table "$ROUTE_TABLE" 2>/dev/null || true
-    ip route add default dev "$WG_IF" table "$ROUTE_TABLE" || fail "failed to add default route via $WG_IF"
+ensure_dnsmasq_core() {
+    # Make sure dnsmasq is authoritative local resolver and does not use ISP DNS directly
+    # It should use only our local DoH proxy on 127.0.0.1#5053
+
+    log "Configuring dnsmasq to use DoH proxy only"
+
+    uci -q set dhcp.@dnsmasq[0].noresolv='1'
+
+    # Remove all existing 'server=' entries to avoid ISP/peer DNS leaks
+    while uci -q del_list dhcp.@dnsmasq[0].server='127.0.0.1#5053' 2>/dev/null; do :; done
+
+    # Brutal but reliable: delete all list server entries by re-creating section values through batch logic
+    # Since UCI doesn't provide "clear list" nicely for all cases, delete and re-add if possible
+    # We do a best-effort:
+    uci -q delete dhcp.@dnsmasq[0].server || true
+    uci add_list dhcp.@dnsmasq[0].server="${DOH_LISTEN_ADDR}#${DOH_LISTEN_PORT}"
+
+    # Optional hardening
+    uci -q set dhcp.@dnsmasq[0].domainneeded='1'
+    uci -q set dhcp.@dnsmasq[0].boguspriv='1'
+    uci -q set dhcp.@dnsmasq[0].filterwin2k='0'
+    uci -q set dhcp.@dnsmasq[0].localservice='1'
+
+    uci commit dhcp
 }
 
-resolve_all_domains() {
-    [ -f "$DOMAINS_FILE" ] || fail "domains file not found: $DOMAINS_FILE"
+ensure_https_dns_proxy() {
+    log "Configuring https-dns-proxy"
 
-    : > "$TMP_FILE"
+    # Delete existing sections with same name if present
+    delete_all_matching_uci_sections https-dns-proxy "main" "."
+    delete_all_matching_uci_sections https-dns-proxy "https-dns-proxy" "resolver_url="
 
-    while IFS= read -r domain; do
-        domain="$(echo "$domain" | sed 's/#.*$//' | tr -d '\r' | xargs)"
-        [ -n "$domain" ] || continue
+    # Main section
+    uci -q delete https-dns-proxy.config || true
+    uci set https-dns-proxy.config='main'
+    uci set https-dns-proxy.config.update_dnsmasq_config='-1'
+    uci set https-dns-proxy.config.force_dns='0'
+    # force_dns here intentionally off because we do firewall hijack ourselves
+    # and we want dnsmasq to remain on :53, DoH proxy on :5053
 
-        log "resolving $domain"
-        resolve_domain_ipv4 "$domain" >> "$TMP_FILE"
-    done < "$DOMAINS_FILE"
+    # Resolver section
+    uci -q delete https-dns-proxy."$DOH_SECTION" || true
+    uci set https-dns-proxy."$DOH_SECTION"='https-dns-proxy'
+    uci set https-dns-proxy."$DOH_SECTION".bootstrap_dns="$DOH_BOOTSTRAP_DNS"
+    uci set https-dns-proxy."$DOH_SECTION".resolver_url="$DOH_RESOLVER_URL"
+    uci set https-dns-proxy."$DOH_SECTION".listen_addr="$DOH_LISTEN_ADDR"
+    uci set https-dns-proxy."$DOH_SECTION".listen_port="$DOH_LISTEN_PORT"
+    uci set https-dns-proxy."$DOH_SECTION".user='nobody'
+    uci set https-dns-proxy."$DOH_SECTION".group='nogroup'
 
-    sort -u "$TMP_FILE" -o "$TMP_FILE"
+    uci commit https-dns-proxy
+
+    /etc/init.d/https-dns-proxy enable || true
+    /etc/init.d/https-dns-proxy restart
 }
 
-lock() {
-    if [ -e "$LOCK_FILE" ]; then
-        oldpid="$(cat "$LOCK_FILE" 2>/dev/null || true)"
-        if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
-            fail "another instance already running (pid $oldpid)"
-        fi
+ensure_dns_hijack_firewall() {
+    # Remove old duplicates
+    delete_all_matching_uci_sections firewall redirect "name='Force-DNS-UDP'"
+    delete_all_matching_uci_sections firewall redirect "name='Force-DNS-TCP'"
+
+    log "Adding DNS hijack redirects (LAN -> router:53)"
+
+    # UDP 53
+    uci add firewall redirect >/dev/null
+    uci set firewall.@redirect[-1].name='Force-DNS-UDP'
+    uci set firewall.@redirect[-1].src='lan'
+    uci set firewall.@redirect[-1].src_dport='53'
+    uci set firewall.@redirect[-1].proto='udp'
+    uci set firewall.@redirect[-1].dest_port='53'
+    uci set firewall.@redirect[-1].target='DNAT'
+    uci set firewall.@redirect[-1].family='ipv4'
+
+    # TCP 53
+    uci add firewall redirect >/dev/null
+    uci set firewall.@redirect[-1].name='Force-DNS-TCP'
+    uci set firewall.@redirect[-1].src='lan'
+    uci set firewall.@redirect[-1].src_dport='53'
+    uci set firewall.@redirect[-1].proto='tcp'
+    uci set firewall.@redirect[-1].dest_port='53'
+    uci set firewall.@redirect[-1].target='DNAT'
+    uci set firewall.@redirect[-1].family='ipv4'
+
+    uci commit firewall
+}
+
+ensure_mark_rule() {
+    # Remove duplicates
+    delete_all_matching_uci_sections firewall rule "name='Mark-VPN-Domains'"
+
+    log "Adding firewall MARK rule for ${IPSET_NAME}"
+
+    uci add firewall rule >/dev/null
+    uci set firewall.@rule[-1].name='Mark-VPN-Domains'
+    uci set firewall.@rule[-1].src='lan'
+    uci set firewall.@rule[-1].proto='all'
+    uci set firewall.@rule[-1].family='ipv4'
+    uci set firewall.@rule[-1].ipset="${IPSET_NAME} dest"
+    uci set firewall.@rule[-1].target='MARK'
+    uci set firewall.@rule[-1].set_mark="${MARK_HEX}"
+
+    uci commit firewall
+}
+
+ensure_policy_routing() {
+    log "Configuring policy routing for mark ${MARK_HEX} -> table ${ROUTE_TABLE_NAME}"
+
+    # Wait for WG interface if needed
+    if ! ip link show "$WG_IF" >/dev/null 2>&1; then
+        warn "WireGuard interface ${WG_IF} not up yet. Restarting network."
+        /etc/init.d/network restart
+        sleep 3
     fi
 
-    echo $$ > "$LOCK_FILE"
-    trap 'rm -f "$LOCK_FILE" "$TMP_FILE"' EXIT INT TERM
+    # Avoid duplicate rules
+    if ! ip rule show | grep -q "fwmark ${MARK_HEX#0x}.*lookup ${ROUTE_TABLE_NAME}"; then
+        ip rule add fwmark "$MARK_HEX" table "$ROUTE_TABLE_NAME" priority 10000 || true
+    fi
+
+    # Replace default route in table
+    ip route replace default dev "$WG_IF" table "$ROUTE_TABLE_NAME"
 }
 
-start_main() {
-    lock
+download_domain_list() {
+    log "Downloading russia_inside domains from ${DOMAINS_URL}"
+    rm -f "$DOMAINS_RAW" "$DOMAINS_CLEAN"
 
-    require_cmd nft
-    require_cmd ip
-    require_cmd nslookup
+    curl -fsSL "$DOMAINS_URL" -o "$DOMAINS_RAW"
 
-    ensure_nft_set
-    ensure_mark_rules
-    ensure_ip_rule
-    ensure_route_table
-    resolve_all_domains
-    load_ips_to_nft
-
-    log "done"
-}
-
-flush_main() {
-    nft list set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET4" >/dev/null 2>&1 && nft flush set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET4" >/dev/null 2>&1
-    log "nft set flushed"
-}
-
-status_main() {
-    echo "=== nft set ==="
-    nft list set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET4" 2>/dev/null || echo "set not found"
-
-    echo
-    echo "=== nft mark rules ==="
-    nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep "wg-domain-routing" || true
-    nft list chain inet fw4 mangle_output 2>/dev/null | grep "wg-domain-routing" || true
-
-    echo
-    echo "=== ip rule ==="
-    ip rule show | grep "lookup $ROUTE_TABLE" || echo "ip rule not found"
-
-    echo
-    echo "=== table $ROUTE_TABLE ==="
-    ip route show table "$ROUTE_TABLE" || echo "route table empty"
-}
-
-case "$1" in
-    start|reload|restart)
-        start_main
-        ;;
-    flush)
-        flush_main
-        ;;
-    status)
-        status_main
-        ;;
-    *)
-        echo "Usage: $0 {start|reload|restart|flush|status}"
+    if [ ! -s "$DOMAINS_RAW" ]; then
+        warn "Downloaded domain list is empty"
         exit 1
-        ;;
-esac
-EOF
+    fi
 
-    chmod +x "$BIN_SCRIPT"
-    ok "Создан $BIN_SCRIPT"
+    # Clean:
+    # - remove comments
+    # - strip CR
+    # - remove leading dots
+    # - keep valid-ish domain names
+    sed 's/\r$//' "$DOMAINS_RAW" \
+        | sed 's/^[.]//' \
+        | sed '/^[[:space:]]*#/d' \
+        | sed '/^[[:space:]]*$/d' \
+        | tr '[:upper:]' '[:lower:]' \
+        | grep -E '^[a-z0-9._-]+\.[a-z0-9._-]+$' \
+        | sed 's/[[:space:]]//g' \
+        | sort -u > "$DOMAINS_CLEAN"
+
+    if [ ! -s "$DOMAINS_CLEAN" ]; then
+        warn "Cleaned domain list is empty after parsing"
+        exit 1
+    fi
+
+    log "Domains prepared: $(wc -l < "$DOMAINS_CLEAN")"
 }
 
-create_init_script() {
-    cat > "$INIT_SCRIPT" << 'EOF'
-#!/bin/sh /etc/rc.common
+apply_domains_to_dnsmasq_ipset() {
+    log "Applying domains to dnsmasq ipset section"
 
-START=99
-USE_PROCD=1
+    # Delete old dhcp ipset sections with same name
+    delete_all_matching_uci_sections dhcp ipset "name='${IPSET_NAME}'"
 
-start_service() {
-    /usr/bin/getdomains-wg start
+    uci add dhcp ipset >/dev/null
+    uci set dhcp.@ipset[-1].name="${IPSET_NAME}"
+
+    # Add each domain
+    while IFS= read -r domain; do
+        [ -n "$domain" ] || continue
+        uci add_list dhcp.@ipset[-1].domain="$domain"
+    done < "$DOMAINS_CLEAN"
+
+    uci commit dhcp
 }
 
-reload_service() {
-    /usr/bin/getdomains-wg reload
-}
-
-service_triggers() {
-    procd_add_reload_trigger network firewall
-}
-EOF
-
-    chmod +x "$INIT_SCRIPT"
-    /etc/init.d/getdomains-wg enable
-    ok "Создан и включен $INIT_SCRIPT"
-}
-
-create_hotplug_script() {
-    mkdir -p /etc/hotplug.d/iface
-
-    cat > "$HOTPLUG_SCRIPT" << 'EOF'
-#!/bin/sh
-
-[ "$ACTION" = "ifup" ] || exit 0
-[ "$INTERFACE" = "wg0" ] || exit 0
-
-logger -t getdomains-wg-hotplug "wg0 is up, refreshing domain routes"
-/usr/bin/getdomains-wg reload
-EOF
-
-    chmod +x "$HOTPLUG_SCRIPT"
-    ok "Создан $HOTPLUG_SCRIPT"
-}
-
-setup_cron() {
-    grep -q "/usr/bin/getdomains-wg reload" "$CRON_FILE" 2>/dev/null || echo "*/30 * * * * /usr/bin/getdomains-wg reload >/dev/null 2>&1" >> "$CRON_FILE"
-    /etc/init.d/cron restart
-    ok "Добавлен cron на обновление каждые 30 минут"
-}
-
-ensure_firewall_ready() {
-    /etc/init.d/firewall enabled >/dev/null 2>&1 || true
+restart_services() {
+    log "Restarting dnsmasq and firewall"
+    /etc/init.d/dnsmasq enable || true
+    /etc/init.d/dnsmasq restart
+    /etc/init.d/firewall enable || true
     /etc/init.d/firewall restart
-    ok "fw4/firewall перезапущен"
 }
 
-run_initial_start() {
-    /etc/init.d/getdomains-wg start || die "Не удалось запустить getdomains-wg"
-    ok "Первичный запуск выполнен"
+show_summary() {
+    echo
+    echo "========================================"
+    echo "Setup complete"
+    echo "========================================"
+    echo "WG interface:           ${WG_IF}"
+    echo "Routing table:          ${ROUTE_TABLE_NAME} (${ROUTE_TABLE_ID})"
+    echo "Mark:                   ${MARK_HEX}"
+    echo "Domain set:             ${IPSET_NAME}"
+    echo "Domain source:          ${DOMAINS_URL}"
+    echo "DoH local listener:     ${DOH_LISTEN_ADDR}:${DOH_LISTEN_PORT}"
+    echo "LAN DNS hijack on:      ${LAN_IF} TCP/UDP 53 -> router:53"
+    echo
+    echo "Check these:"
+    echo "  logread | grep https-dns-proxy"
+    echo "  netstat -lntup | grep 5053"
+    echo "  nslookup example.com 127.0.0.1"
+    echo "  ip rule show"
+    echo "  ip route show table ${ROUTE_TABLE_NAME}"
+    echo "  nft list ruleset | grep -i dns"
+    echo "========================================"
+    echo
 }
 
-show_status() {
-    echo
-    info "Проверка статуса:"
-    /usr/bin/getdomains-wg status || true
-}
+# ---------- main ----------
 
-main() {
-    info "Установка selective domain routing для WireGuard на OpenWrt 25.12.1+"
-    check_prereqs
-    create_dirs_and_files
-    create_getdomains_script
-    create_init_script
-    create_hotplug_script
-    setup_cron
-    ensure_firewall_ready
-    run_initial_start
-    show_status
+log "Ensuring required packages"
+ensure_pkg dnsmasq-full
+ensure_pkg curl
+ensure_pkg ca-bundle
+ensure_pkg wireguard-tools
+ensure_pkg kmod-wireguard
+ensure_pkg https-dns-proxy
 
-    echo
-    ok "Готово."
-    echo
-    echo "Файл доменов: $DOMAINS_FILE"
-    echo "Редактировать список доменов:"
-    echo "  vi $DOMAINS_FILE"
-    echo
-    echo "Обновить вручную:"
-    echo "  /usr/bin/getdomains-wg reload"
-    echo
-    echo "Статус:"
-    echo "  /usr/bin/getdomains-wg status"
-    echo
-    echo "Если WG интерфейс НЕ wg0 — правь WG_IF в:"
-    echo "  $BIN_SCRIPT"
-    echo "  $HOTPLUG_SCRIPT"
-}
+# firewall4 is default in modern OpenWrt; no package install here
 
-main "$@"
+ensure_rt_table
+ensure_wg_config
+ensure_wg_firewall_zone
+ensure_ipset_section
+ensure_https_dns_proxy
+ensure_dnsmasq_core
+ensure_dns_hijack_firewall
+ensure_mark_rule
+download_domain_list
+apply_domains_to_dnsmasq_ipset
+restart_services
+ensure_policy_routing
+show_summary
