@@ -1,980 +1,422 @@
 #!/bin/sh
 
-SCRIPTS_DIR="/etc/init.d"
-TMP_DIR="/tmp"
-HIVPN_SCRIPT_FILENAME="hivpn"
-GETDOMAINS_SCRIPT_FILENAME="getdomains"
-DUMP_FILENAME="dump.txt"
+set -eu
 
-HIVPN_SCRIPT_PATH="$SCRIPTS_DIR/$HIVPN_SCRIPT_FILENAME"
-GETDOMAINS_SCRIPT_PATH="$SCRIPTS_DIR/$GETDOMAINS_SCRIPT_FILENAME"
-DUMP_PATH="$TMP_DIR/$DUMP_FILENAME"
+BASE_DIR="/etc/hivpn"
+BIN_SCRIPT="/usr/bin/getdomains-wg"
+INIT_SCRIPT="/etc/init.d/getdomains-wg"
+HOTPLUG_SCRIPT="/etc/hotplug.d/iface/95-getdomains-wg"
+DOMAINS_FILE="$BASE_DIR/domains.lst"
+CRON_FILE="/etc/crontabs/root"
 
-COLOR_BOLD_BLUE="\033[34;1m"
-COLOR_BOLD_GREEN="\033[32;1m"
-COLOR_BOLD_RED="\033[31;1m"
-COLOR_BOLD_CYAN="\033[36;1m"
-COLOR_RESET="\033[0m"
+WG_IF="wg0"
+NFT_FAMILY="inet"
+NFT_TABLE="fw4"
+NFT_SET4="vpn_domains"
+FWMARK_HEX="0x1"
+ROUTE_TABLE="100"
+ROUTE_PRIORITY="10000"
 
-UNSUPPORTED_OPENWRT_VERSION="21.02"
-MIN_RAM="256"
-DNSMASQ_FULL_REQUIRED_VERSION="2.87"
+GETDOMAINS_URL="https://raw.githubusercontent.com/Ktoto59/test_work/refs/heads/main/getdomains-install.sh"
 
-SINGBOX_CONFIG_PATH="/etc/config/sing-box"
-SINGBOX_JSON_CONFIG="/etc/sing-box/config.json"
+GREEN="\033[32;1m"
+RED="\033[31;1m"
+BLUE="\033[34;1m"
+YELLOW="\033[33;1m"
+RESET="\033[0m"
 
-CURL_PACKAGE="curl"
-DNSMASQ_PACKAGE="dnsmasq"
-DNSMASQ_FULL_PACKAGE="$DNSMASQ_PACKAGE-full"
-XRAY_CORE_PACKAGE="xray-core"
-LUCI_APP_XRAY_PACKAGE="luci-app-xray"
-WIREGUARD_TOOLS_PACKAGE="wireguard-tools"
-OPENVPN_PACKAGE="openvpn"
-SINGBOX_PACKAGE="sing-box"
-TUN2SOCKS_PACKAGE="tun2socks"
-DNSCRYPT_PACKAGE="dnscrypt-proxy2"
-STUBBY_PACKAGE="stubby"
+ok() {
+    printf "${GREEN}[✓] %s${RESET}\n" "$1"
+}
 
-WIREGUARD_PROTOCOL="Wireguard"
-OPENVPN_PROTOCOL="OpenVPN"
-TUN2SOCKS_PROTOCOL="tun2socks"
+warn() {
+    printf "${YELLOW}[!] %s${RESET}\n" "$1"
+}
 
-LANGUAGE="ru"
-SUPPORTED_LANGUAGES="ru, en"
-COMMAND=""
+err() {
+    printf "${RED}[x] %s${RESET}\n" "$1"
+}
 
-# -----------------------------
-# Helpers
-# -----------------------------
+info() {
+    printf "${BLUE}[*] %s${RESET}\n" "$1"
+}
+
+die() {
+    err "$1"
+    exit 1
+}
+
+cmd_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+ensure_cmd() {
+    cmd_exists "$1" || die "Команда не найдена: $1"
+}
+
+get_wg_uci_iface() {
+    uci show network 2>/dev/null | grep "=interface" | cut -d. -f2 | cut -d= -f1 | while read -r s; do
+        proto="$(uci -q get network."$s".proto || true)"
+        device="$(uci -q get network."$s".device || true)"
+        ifname="$(uci -q get network."$s".ifname || true)"
+        if [ "$proto" = "wireguard" ]; then
+            echo "$s"
+            return 0
+        fi
+        if [ "$device" = "$WG_IF" ] || [ "$ifname" = "$WG_IF" ]; then
+            echo "$s"
+            return 0
+        fi
+    done
+    return 1
+}
+
+check_prereqs() {
+    ensure_cmd ip
+    ensure_cmd nft
+    ensure_cmd nslookup
+    ensure_cmd uci
+    ensure_cmd grep
+    ensure_cmd awk
+    ensure_cmd sed
+    ensure_cmd sort
+    ensure_cmd logger
+
+    if ! cmd_exists curl; then
+        warn "curl не найден, ставлю..."
+        opkg update
+        opkg install curl || die "Не удалось установить curl"
+    fi
+
+    if ! ip link show "$WG_IF" >/dev/null 2>&1; then
+        die "Интерфейс $WG_IF не найден. Проверь имя WG интерфейса."
+    fi
+
+    if ip link show "$WG_IF" | grep -q "UP"; then
+        ok "Интерфейс $WG_IF найден и поднят"
+    else
+        warn "Интерфейс $WG_IF найден, но сейчас не UP. Продолжаем."
+    fi
+
+    WG_UCI_IFACE="$(get_wg_uci_iface || true)"
+    if [ -n "${WG_UCI_IFACE:-}" ]; then
+        RAI="$(uci -q get network."$WG_UCI_IFACE".route_allowed_ips || echo 0)"
+        if [ "$RAI" = "1" ]; then
+            die "У интерфейса network.$WG_UCI_IFACE включен route_allowed_ips=1. Это ломает selective routing. Выключи: uci set network.$WG_UCI_IFACE.route_allowed_ips='0'; uci commit network; service network restart"
+        else
+            ok "route_allowed_ips=0 (или не задан) для network.$WG_UCI_IFACE"
+        fi
+    else
+        warn "Не удалось однозначно определить UCI-секцию WireGuard. Проверь route_allowed_ips вручную."
+    fi
+}
+
+create_dirs_and_files() {
+    mkdir -p "$BASE_DIR"
+
+    if [ ! -f "$DOMAINS_FILE" ]; then
+        cat > "$DOMAINS_FILE" << 'EOF'
+instagram.com
+facebook.com
+fbcdn.net
+cdninstagram.com
+whatsapp.com
+whatsapp.net
+youtube.com
+googlevideo.com
+ytimg.com
+youtu.be
+EOF
+        ok "Создан список доменов: $DOMAINS_FILE"
+    else
+        ok "Список доменов уже существует: $DOMAINS_FILE"
+    fi
+}
+
+create_getdomains_script() {
+    cat > "$BIN_SCRIPT" << 'EOF'
+#!/bin/sh
+
+DOMAINS_FILE="/etc/hivpn/domains.lst"
+NFT_FAMILY="inet"
+NFT_TABLE="fw4"
+NFT_SET4="vpn_domains"
+
+WG_IF="wg0"
+FWMARK_HEX="0x1"
+ROUTE_TABLE="100"
+ROUTE_PRIORITY="10000"
+
+TMP_FILE="/tmp/getdomains-wg.ips"
+LOCK_FILE="/var/run/getdomains-wg.lock"
+LOG_TAG="getdomains-wg"
+
+log() {
+    logger -t "$LOG_TAG" "$*"
+    echo "$LOG_TAG: $*"
+}
+
+fail() {
+    log "ERROR: $*"
+    exit 1
+}
 
 command_exists() {
-  command -v "$1" >/dev/null 2>&1
+    command -v "$1" >/dev/null 2>&1
 }
 
-package_installed() {
-  opkg list-installed 2>/dev/null | grep -q "^$1[[:space:]]-"
+require_cmd() {
+    command_exists "$1" || fail "command not found: $1"
 }
 
-service_running() {
-  local svc="$1"
+resolve_domain_ipv4() {
+    local domain="$1"
 
-  if [ -x "/etc/init.d/$svc" ]; then
-    if "/etc/init.d/$svc" status 2>/dev/null | grep -qi "running"; then
-      return 0
+    nslookup "$domain" 127.0.0.1 2>/dev/null \
+        | awk '/^Address [0-9]+: / {print $3} /^Address: / {print $2}' \
+        | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' \
+        | sort -u
+}
+
+ensure_nft_set() {
+    nft list set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET4" >/dev/null 2>&1 && return 0
+
+    nft add set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET4" "{ type ipv4_addr; flags interval; comment \"WG domain routing\"; }" \
+        || fail "failed to create nft set $NFT_SET4"
+}
+
+flush_nft_set() {
+    nft flush set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET4" >/dev/null 2>&1 \
+        || fail "failed to flush nft set $NFT_SET4"
+}
+
+load_ips_to_nft() {
+    local count
+    count="$(wc -l < "$TMP_FILE" | tr -d ' ')"
+    [ -n "$count" ] || count=0
+
+    flush_nft_set
+
+    if [ "$count" -eq 0 ]; then
+        log "no IPs resolved, nft set left empty"
+        return 0
     fi
-  fi
 
-  if service "$svc" status 2>/dev/null | grep -qi "running"; then
-    return 0
-  fi
+    while IFS= read -r ip; do
+        [ -n "$ip" ] || continue
+        nft add element "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET4" "{ $ip }" \
+            || log "failed to add IP $ip"
+    done < "$TMP_FILE"
 
-  return 1
+    log "loaded $count IPs into nft set $NFT_SET4"
 }
 
-get_openwrt_release() {
-  if [ -f /etc/openwrt_release ]; then
-    . /etc/openwrt_release
-    OPENWRT_RELEASE="${DISTRIB_RELEASE:-unknown}"
-    OPENWRT_DESCRIPTION="${DISTRIB_DESCRIPTION:-OpenWrt}"
-  elif [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OPENWRT_RELEASE="${VERSION_ID:-unknown}"
-    OPENWRT_DESCRIPTION="${PRETTY_NAME:-OpenWrt}"
-  else
-    OPENWRT_RELEASE="unknown"
-    OPENWRT_DESCRIPTION="OpenWrt"
-  fi
+ensure_mark_rules() {
+    nft list chain inet fw4 mangle_prerouting >/dev/null 2>&1 || fail "chain inet fw4 mangle_prerouting not found"
+    nft list chain inet fw4 mangle_output >/dev/null 2>&1 || fail "chain inet fw4 mangle_output not found"
+
+    nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep -Fq 'comment "wg-domain-routing-prerouting"' || \
+        nft insert rule inet fw4 mangle_prerouting ip daddr @"$NFT_SET4" meta mark set "$FWMARK_HEX" comment "wg-domain-routing-prerouting" || \
+        fail "failed to add prerouting mark rule"
+
+    nft list chain inet fw4 mangle_output 2>/dev/null | grep -Fq 'comment "wg-domain-routing-output"' || \
+        nft insert rule inet fw4 mangle_output ip daddr @"$NFT_SET4" meta mark set "$FWMARK_HEX" comment "wg-domain-routing-output" || \
+        fail "failed to add output mark rule"
 }
 
-version_ge() {
-  # usage: version_ge "2.90" "2.87"
-  local v1="$1"
-  local v2="$2"
-
-  [ "$(printf '%s\n%s\n' "$v2" "$v1" | sort -V | tail -n1)" = "$v1" ]
+ensure_ip_rule() {
+    ip rule show | grep -q "fwmark 0x1 lookup $ROUTE_TABLE" && return 0
+    ip rule add fwmark "$FWMARK_HEX" table "$ROUTE_TABLE" priority "$ROUTE_PRIORITY" 2>/dev/null || true
 }
 
-get_dnsmasq_full_version() {
-  opkg list-installed 2>/dev/null | awk '
-    $1=="dnsmasq-full" && $2=="-" {
-      split($3, a, "-")
-      print a[1]
-      exit
-    }
-  '
+ensure_route_table() {
+    ip route show table "$ROUTE_TABLE" | grep -q "^default dev $WG_IF" && return 0
+    ip route del default table "$ROUTE_TABLE" 2>/dev/null || true
+    ip route add default dev "$WG_IF" table "$ROUTE_TABLE" || fail "failed to add default route via $WG_IF"
 }
 
-get_first_ipv4_from_nslookup() {
-  # usage: get_first_ipv4_from_nslookup domain [dns_server]
-  local domain="$1"
-  local dns_server="$2"
+resolve_all_domains() {
+    [ -f "$DOMAINS_FILE" ] || fail "domains file not found: $DOMAINS_FILE"
 
-  if [ -n "$dns_server" ]; then
-    nslookup -type=a -timeout=2 -retry=1 "$domain" "$dns_server" 2>/dev/null \
-      | awk '/^Address [0-9]*: / {print $3} /^Address: / {print $2}' \
-      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
-      | tail -n1
-  else
-    nslookup -type=a -timeout=2 -retry=1 "$domain" 2>/dev/null \
-      | awk '/^Address [0-9]*: / {print $3} /^Address: / {print $2}' \
-      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
-      | tail -n1
-  fi
+    : > "$TMP_FILE"
+
+    while IFS= read -r domain; do
+        domain="$(echo "$domain" | sed 's/#.*$//' | tr -d '\r' | xargs)"
+        [ -n "$domain" ] || continue
+
+        log "resolving $domain"
+        resolve_domain_ipv4 "$domain" >> "$TMP_FILE"
+    done < "$DOMAINS_FILE"
+
+    sort -u "$TMP_FILE" -o "$TMP_FILE"
 }
 
-get_external_ip() {
-  if ! command_exists curl; then
-    return 1
-  fi
-
-  curl -4 -s --connect-timeout 5 https://ifconfig.me 2>/dev/null \
-    | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
-    && return 0
-
-  curl -4 -s --connect-timeout 5 https://ifconfig.io/ip 2>/dev/null \
-    | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
-    && return 0
-
-  curl -4 -s --connect-timeout 5 https://api.ipify.org 2>/dev/null \
-    | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
-    && return 0
-
-  return 1
-}
-
-get_external_ip_via_iface() {
-  # usage: get_external_ip_via_iface tun0
-  local iface="$1"
-
-  if ! command_exists curl; then
-    return 1
-  fi
-
-  curl -4 --interface "$iface" -s --connect-timeout 7 https://ifconfig.me 2>/dev/null \
-    | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
-    && return 0
-
-  curl -4 --interface "$iface" -s --connect-timeout 7 https://ifconfig.io/ip 2>/dev/null \
-    | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
-    && return 0
-
-  curl -4 --interface "$iface" -s --connect-timeout 7 https://api.ipify.org 2>/dev/null \
-    | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' \
-    && return 0
-
-  return 1
-}
-
-route_table_has_default_dev() {
-  # usage: route_table_has_default_dev vpn wg0
-  local table="$1"
-  local dev="$2"
-
-  ip route show table "$table" 2>/dev/null | grep -q "default dev $dev"
-}
-
-route_table_has_any_default() {
-  # usage: route_table_has_any_default vpn
-  local table="$1"
-
-  ip route show table "$table" 2>/dev/null | grep -q '^default '
-}
-
-safe_crontab_has() {
-  local needle="$1"
-
-  crontab -l 2>/dev/null | grep -qF "$needle"
-}
-
-checkpoint_true() {
-  printf "$COLOR_BOLD_GREEN[\342\234\223] $1$COLOR_RESET\n"
-}
-
-checkpoint_false() {
-  printf "$COLOR_BOLD_RED[x] $1$COLOR_RESET\n"
-}
-
-output_21() {
-  if [ "$VERSION_ID" = "21" ]; then
-    echo "$UNSUPPORTED_OPENWRT"
-  fi
-}
-
-update_vpn_ip() {
-  local template="$1"
-  local ip="$2"
-  printf "$template" "$ip"
-}
-
-# -----------------------------
-# Localization
-# -----------------------------
-
-set_language_en() {
-  DEVICE_MODEL="Model"
-  OPENWRT_VERSION="Version"
-  CURRENT_DATE="Date"
-  INSTALLED="is installed"
-  NOT_INSTALLED="is not installed"
-  RUNNING="is running"
-  NOT_RUNNING="is not running"
-  ENABLED="is enabled"
-  DISABLED="is disabled"
-  EXISTS="exists"
-  DOESNT_EXIST="doesn't exist"
-  UNSUPPORTED_OPENWRT="You are using OpenWrt $UNSUPPORTED_OPENWRT_VERSION. This check script does not support it."
-  RAM_WARNING="Your router has less than $MIN_RAM MB of RAM. It is recommended to use only the vpn_domains list."
-  CURL_INSTALLED="$CURL_PACKAGE $INSTALLED"
-  CURL_NOT_INSTALLED="$CURL_PACKAGE $NOT_INSTALLED. Install it: opkg install $CURL_PACKAGE"
-  DNSMASQ_FULL_INSTALLED="$DNSMASQ_FULL_PACKAGE $INSTALLED"
-  DNSMASQ_FULL_NOT_INSTALLED="$DNSMASQ_FULL_PACKAGE $NOT_INSTALLED"
-  DNSMASQ_FULL_DETAILS="If you don't use vpn_domains set, it's OK\nCheck version: opkg list-installed | grep $DNSMASQ_FULL_PACKAGE\nRequired version >= $DNSMASQ_FULL_REQUIRED_VERSION. For OpenWrt 22.03 follow manual: https://t.me/itdoginfo/12"
-  OPENWRT_21_DETAILS="\nYou are using OpenWrt $UNSUPPORTED_OPENWRT_VERSION. This check does not support it.\nManual for OpenWrt $UNSUPPORTED_OPENWRT_VERSION: https://t.me/itdoginfo/8"
-  XRAY_CORE_PACKAGE_DETECTED="$XRAY_CORE_PACKAGE package detected"
-  LUCI_APP_XRAY_PACKAGE_DETECTED="$LUCI_APP_XRAY_PACKAGE package detected which is incompatible. Remove it: opkg remove $LUCI_APP_XRAY_PACKAGE --force-removal-of-dependent-packages"
-  DNSMASQ_SERVICE_RUNNING="$DNSMASQ_PACKAGE service $RUNNING"
-  DNSMASQ_SERVICE_NOT_RUNNING="$DNSMASQ_PACKAGE service $NOT_RUNNING. Check configuration: /etc/config/dhcp"
-  INTERNET_IS_AVAILABLE="Internet is available"
-  INTERNET_IS_NOT_AVAILABLE="Internet is not available"
-  INTERNET_DETAILS="Check internet connection. If it's ok, check date on router. Details: https://cli.co/2EaW4rO\nFor more info run: curl -Is https://community.antifilter.download/"
-  IPV6_DETECTED="IPv6 detected. This script does not currently work with IPv6"
-  WIREGUARD_TOOLS_INSTALLED="$WIREGUARD_TOOLS_PACKAGE $INSTALLED"
-  WIREGUARD_ROUTING_DOESNT_WORK="Tunnel to the $WIREGUARD_PROTOCOL server works, but routing to the internet does not work. Check server configuration. Details: https://cli.co/RSCvOxI"
-  WIREGUARD_TUNNEL_NOT_WORKING="Bad news: $WIREGUARD_PROTOCOL tunnel isn't working. Check your $WIREGUARD_PROTOCOL configuration. Details: https://cli.co/hGUUXDs\nIf you don't use $WIREGUARD_PROTOCOL, but $OPENVPN_PROTOCOL for example, it's OK"
-  WIREGUARD_ROUTE_ALLOWED_IPS_ENABLED="$WIREGUARD_PROTOCOL route_allowed_ips $ENABLED. All traffic goes into the tunnel. Read more at: https://cli.co/SaxBzH7"
-  WIREGUARD_ROUTE_ALLOWED_IPS_DISABLED="$WIREGUARD_PROTOCOL route_allowed_ips $DISABLED"
-  WIREGUARD_ROUTING_TABLE_EXISTS="$WIREGUARD_PROTOCOL routing table $EXISTS"
-  WIREGUARD_ROUTING_TABLE_DOESNT_EXIST="$WIREGUARD_PROTOCOL routing table $DOESNT_EXIST. Details: https://cli.co/Atxr6U3"
-  OPENVPN_INSTALLED="$OPENVPN_PACKAGE $INSTALLED"
-  OPENVPN_ROUTING_DOESNT_WORK="Tunnel to the $OPENVPN_PROTOCOL server works, but routing to the internet does not work. Check server configuration."
-  OPENVPN_TUNNEL_NOT_WORKING="Bad news: $OPENVPN_PROTOCOL tunnel isn't working. Check your $OPENVPN_PROTOCOL configuration."
-  OPENVPN_REDIRECT_GATEWAY_ENABLED="$OPENVPN_PROTOCOL redirect-gateway $ENABLED. All traffic goes into the tunnel. Read more at: https://cli.co/vzTNq_3"
-  OPENVPN_REDIRECT_GATEWAY_DISABLED="$OPENVPN_PROTOCOL redirect-gateway $DISABLED"
-  OPENVPN_ROUTING_TABLE_EXISTS="$OPENVPN_PROTOCOL routing table $EXISTS"
-  OPENVPN_ROUTING_TABLE_DOESNT_EXIST="$OPENVPN_PROTOCOL routing table $DOESNT_EXIST. Details: https://cli.co/Atxr6U3"
-  SINGBOX_INSTALLED="$SINGBOX_PACKAGE $INSTALLED"
-  SINGBOX_ROUTING_TABLE_EXISTS="$SINGBOX_PACKAGE routing table $EXISTS"
-  SINGBOX_ROUTING_TABLE_DOESNT_EXIST="$SINGBOX_PACKAGE routing table $DOESNT_EXIST. Try: service network restart. Details: https://cli.co/n7xAbc1"
-  SINGBOX_UCI_CONFIG_OK="$SINGBOX_PACKAGE UCI configuration has been successfully validated"
-  SINGBOX_UCI_CONFIG_ERROR="$SINGBOX_PACKAGE Error validation UCI configuration. Check $SINGBOX_CONFIG_PATH"
-  SINGBOX_CONFIG_OK="$SINGBOX_PACKAGE configuration has been successfully validated"
-  SINGBOX_CONFIG_ERROR="$SINGBOX_PACKAGE configuration validation error"
-  SINGBOX_WORKING_TEMPLATE="$SINGBOX_PACKAGE works. VPN IP: %s"
-  SINGBOX_ROUTING_DOESNT_WORK="$SINGBOX_PACKAGE: Your traffic is not routed through the VPN. Check configuration: https://cli.co/Badmn3K"
-  TUN2SOCKS_INSTALLED="$TUN2SOCKS_PACKAGE $INSTALLED"
-  TUN2SOCKS_ROUTING_TABLE_EXISTS="$TUN2SOCKS_PROTOCOL routing table $EXISTS"
-  TUN2SOCKS_ROUTING_TABLE_DOESNT_EXIST="$TUN2SOCKS_PROTOCOL routing table $DOESNT_EXIST. Try: service network restart. Details: https://cli.co/n7xAbc1"
-  TUN2SOCKS_WORKING_TEMPLATE="$TUN2SOCKS_PACKAGE works. VPN IP: %s"
-  TUN2SOCKS_ROUTING_DOESNT_WORK="$TUN2SOCKS_PACKAGE: Your traffic is not routed through the VPN. Check configuration: https://cli.co/VNZISEM"
-  VPN_DOMAINS_SET_EXISTS="vpn_domains set $EXISTS"
-  VPN_DOMAINS_SET_DOESNT_EXIST="vpn_domains set $DOESNT_EXIST"
-  IPS_IN_VPN_DOMAINS_SET_OK="IPs are successfully added to vpn_domains set"
-  IPS_IN_VPN_DOMAINS_SET_ERROR="IPs were not added to vpn_domains set"
-  VPN_DOMAINS_DETAILS="If you don't use vpn_domains, it's OK.\nBut if you want to use it, check the configuration and run: service getdomains start"
-  VPN_DOMAINS_DETAILS_2="If you don't use vpn_domains, it's OK.\nBut if you want use, check the configuration: https://cli.co/AwUGeM6"
-  VPN_IP_SET_EXISTS="vpn_ip set $EXISTS"
-  VPN_IP_SET_DOESNT_EXIST="vpn_ip set $DOESNT_EXIST. Check configuration: https://cli.co/AwUGeM6"
-  IPS_IN_VPN_IP_SET_OK="IPs are successfully added to vpn_ip set"
-  IPS_IN_VPN_IP_SET_ERROR="IPs were not added to vpn_ip set. But if you want to use it, check configuration"
-  VPN_SUBNET_SET_EXISTS="vpn_subnets set $EXISTS"
-  VPN_SUBNET_SET_DOESNT_EXIST="vpn_subnets set $DOESNT_EXIST. Check configuration: https://cli.co/AwUGeM6"
-  IPS_IN_VPN_SUBNET_SET_OK="IPs are successfully added to vpn_subnets set"
-  IPS_IN_VPN_SUBNET_SET_ERROR="IPs were not added to vpn_subnets set. But if you want to use it, check configs"
-  VPN_COMMUNITY_SET_EXISTS="vpn_community set $EXISTS"
-  VPN_COMMUNITY_SET_DOESNT_EXIST="vpn_community set $DOESNT_EXIST. Check configuration: https://cli.co/AwUGeM6"
-  IPS_IN_VPN_COMMUNITY_SET_OK="IPs are successfully added to vpn_community set"
-  IPS_IN_VPN_COMMUNITY_SET_ERROR="IPs were not added to vpn_community set. But if you want to use it, check configs"
-  GETDOMAINS_SCRIPT_EXISTS="Script $GETDOMAINS_SCRIPT_FILENAME $EXISTS"
-  GETDOMAINS_SCRIPT_DOESNT_EXIST="Script $GETDOMAINS_SCRIPT_FILENAME $DOESNT_EXIST. Script doesn't exists in $GETDOMAINS_SCRIPT_PATH. If you don't use getdomains, it's OK"
-  GETDOMAINS_SCRIPT_CRONTAB_OK="Script $GETDOMAINS_SCRIPT_FILENAME has been successfully added to crontab"
-  GETDOMAINS_SCRIPT_CRONTAB_ERROR="Script $GETDOMAINS_SCRIPT_FILENAME has not been added to crontab. Check: crontab -l"
-  DNSCRYPT_INSTALLED="$DNSCRYPT_PACKAGE $INSTALLED"
-  DNSCRYPT_SERVICE_RUNNING="$DNSCRYPT_PACKAGE service $RUNNING"
-  DNSCRYPT_SERVICE_NOT_RUNNING="$DNSCRYPT_PACKAGE service $NOT_RUNNING. Check configuration: https://cli.co/wN-tc_S"
-  DNSMASQ_CONFIG_FOR_DNSCRYPT_OK="$DNSMASQ_PACKAGE configuration for $DNSCRYPT_PACKAGE is ok"
-  DNSMASQ_CONFIG_FOR_DNSCRYPT_ERROR="$DNSMASQ_PACKAGE configuration for $DNSCRYPT_PACKAGE is not ok. Check configuration: https://cli.co/rooc0uz"
-  STUBBY_INSTALLED="$STUBBY_PACKAGE $INSTALLED"
-  STUBBY_SERVICE_RUNNING="$STUBBY_PACKAGE service $RUNNING"
-  STUBBY_SERVICE_NOT_RUNNING="$STUBBY_PACKAGE service $NOT_RUNNING. Check configuration: https://cli.co/HbDBT2V"
-  DNSMASQ_CONFIG_FOR_STUBBY_OK="$DNSMASQ_PACKAGE configuration for $STUBBY_PACKAGE is ok"
-  DNSMASQ_CONFIG_FOR_STUBBY_ERROR="$DNSMASQ_PACKAGE configuration for $STUBBY_PACKAGE is not ok. Check configuration: https://cli.co/HbDBT2V"
-  DUMP_CREATION="Creating dump without private variables"
-  DUMP_DETAILS="Dump is here: $DUMP_PATH\nFor download on Linux/Mac use: scp root@IP_ROUTER:$DUMP_PATH .\nFor Windows use WinSCP/PSCP or WSL"
-  DNS_CHECK="Checking DNS servers"
-  IS_DNS_TRAFFIC_BLOCKED="Checking DNS traffic blocking (Port 53/udp is available)"
-  IS_DOH_AVAILABLE="Checking DOH availability"
-  RESPONSE_NOT_CONTAINS_127_0_0_8="Checking that the response does not contain an address from 127.0.0.8"
-  ONE_IP_FOR_TWO_DOMAINS="Checking IP for two different domains"
-  IPS_ARE_THE_SAME="IPs are the same"
-  IPS_ARE_DIFFERENT="IPs are different"
-  RESPONSE_IS_NOT_BLANK="Checking if response is not blank"
-  DNS_POISONING_CHECK="Comparing response from unencrypted DNS and DoH (DNS poisoning)"
-  TELEGRAM_CHANNEL="Telegram channel"
-  TELEGRAM_CHAT="Telegram chat"
-}
-
-set_language_ru() {
-  DEVICE_MODEL="Модель"
-  OPENWRT_VERSION="Версия"
-  CURRENT_DATE="Дата"
-  INSTALLED="установлен"
-  NOT_INSTALLED="не установлен"
-  RUNNING="запущен"
-  NOT_RUNNING="не запущен"
-  ENABLED="включен"
-  DISABLED="выключен"
-  EXISTS="существует"
-  DOESNT_EXIST="не существует"
-  UNSUPPORTED_OPENWRT="Вы используете OpenWrt $UNSUPPORTED_OPENWRT_VERSION. Этот скрипт проверки её не поддерживает."
-  RAM_WARNING="У вашего роутера менее $MIN_RAM МБ ОЗУ. Рекомендуется использовать только vpn_domains set."
-  CURL_INSTALLED="$CURL_PACKAGE $INSTALLED"
-  CURL_NOT_INSTALLED="$CURL_PACKAGE $NOT_INSTALLED. Установите его: opkg install $CURL_PACKAGE"
-  DNSMASQ_FULL_INSTALLED="$DNSMASQ_FULL_PACKAGE $INSTALLED"
-  DNSMASQ_FULL_NOT_INSTALLED="$DNSMASQ_FULL_PACKAGE $NOT_INSTALLED"
-  DNSMASQ_FULL_DETAILS="Если вы не используете vpn_domains set, это нормально\nПроверьте версию: opkg list-installed | grep $DNSMASQ_FULL_PACKAGE\nТребуемая версия >= $DNSMASQ_FULL_REQUIRED_VERSION. Для OpenWrt 22.03 следуйте инструкции: https://t.me/itdoginfo/12"
-  OPENWRT_21_DETAILS="\nВы используете OpenWrt $UNSUPPORTED_OPENWRT_VERSION. Этот скрипт её не поддерживает.\nИнструкция для OpenWrt $UNSUPPORTED_OPENWRT_VERSION: https://t.me/itdoginfo/8"
-  XRAY_CORE_PACKAGE_DETECTED="Обнаружен пакет $XRAY_CORE_PACKAGE"
-  LUCI_APP_XRAY_PACKAGE_DETECTED="Обнаружен пакет $LUCI_APP_XRAY_PACKAGE, который не совместим. Удалите его: opkg remove $LUCI_APP_XRAY_PACKAGE --force-removal-of-dependent-packages"
-  DNSMASQ_SERVICE_RUNNING="Сервис $DNSMASQ_PACKAGE $RUNNING"
-  DNSMASQ_SERVICE_NOT_RUNNING="Сервис $DNSMASQ_PACKAGE $NOT_RUNNING. Проверьте конфигурацию: /etc/config/dhcp"
-  INTERNET_IS_AVAILABLE="Интернет доступен"
-  INTERNET_IS_NOT_AVAILABLE="Интернет недоступен"
-  INTERNET_DETAILS="Проверьте подключение к интернету. Если оно в порядке, проверьте дату на роутере. Подробности: https://cli.co/2EaW4rO\nДополнительно выполните: curl -Is https://community.antifilter.download/"
-  IPV6_DETECTED="Обнаружен IPv6. Этот скрипт не поддерживает работу с IPv6"
-  WIREGUARD_TOOLS_INSTALLED="$WIREGUARD_TOOLS_PACKAGE $INSTALLED"
-  WIREGUARD_ROUTING_DOESNT_WORK="Туннель к $WIREGUARD_PROTOCOL серверу работает, но маршрутизация в интернет не работает. Проверьте конфигурацию сервера. Подробности: https://cli.co/RSCvOxI"
-  WIREGUARD_TUNNEL_NOT_WORKING="Плохие новости: туннель $WIREGUARD_PROTOCOL не работает. Проверьте конфигурацию $WIREGUARD_PROTOCOL. Подробности: https://cli.co/hGUUXDs\nЕсли вы не используете $WIREGUARD_PROTOCOL, а, например, $OPENVPN_PROTOCOL, то это нормально"
-  WIREGUARD_ROUTE_ALLOWED_IPS_ENABLED="$WIREGUARD_PROTOCOL route_allowed_ips $ENABLED. Весь трафик идет в туннель. Подробнее: https://cli.co/SaxBzH7"
-  WIREGUARD_ROUTE_ALLOWED_IPS_DISABLED="$WIREGUARD_PROTOCOL route_allowed_ips $DISABLED"
-  WIREGUARD_ROUTING_TABLE_EXISTS="Таблица маршрутизации $WIREGUARD_PROTOCOL $EXISTS"
-  WIREGUARD_ROUTING_TABLE_DOESNT_EXIST="Таблица маршрутизации $WIREGUARD_PROTOCOL $DOESNT_EXIST. Подробности: https://cli.co/Atxr6U3"
-  OPENVPN_INSTALLED="$OPENVPN_PACKAGE $INSTALLED"
-  OPENVPN_ROUTING_DOESNT_WORK="Туннель к $OPENVPN_PROTOCOL серверу работает, но маршрутизация в интернет не работает. Проверьте конфигурацию сервера."
-  OPENVPN_TUNNEL_NOT_WORKING="Плохие новости: туннель $OPENVPN_PROTOCOL не работает. Проверьте конфигурацию $OPENVPN_PROTOCOL."
-  OPENVPN_REDIRECT_GATEWAY_ENABLED="$OPENVPN_PROTOCOL redirect-gateway $ENABLED. Весь трафик идет в туннель. Подробнее: https://cli.co/vzTNq_3"
-  OPENVPN_REDIRECT_GATEWAY_DISABLED="$OPENVPN_PROTOCOL redirect-gateway $DISABLED"
-  OPENVPN_ROUTING_TABLE_EXISTS="Таблица маршрутизации $OPENVPN_PROTOCOL $EXISTS"
-  OPENVPN_ROUTING_TABLE_DOESNT_EXIST="Таблица маршрутизации $OPENVPN_PROTOCOL $DOESNT_EXIST. Подробности: https://cli.co/Atxr6U3"
-  SINGBOX_INSTALLED="$SINGBOX_PACKAGE $INSTALLED"
-  SINGBOX_ROUTING_TABLE_EXISTS="Таблица маршрутизации $SINGBOX_PACKAGE $EXISTS"
-  SINGBOX_ROUTING_TABLE_DOESNT_EXIST="Таблица маршрутизации $SINGBOX_PACKAGE $DOESNT_EXIST. Попробуйте: service network restart. Подробности: https://cli.co/n7xAbc1"
-  SINGBOX_UCI_CONFIG_OK="UCI конфигурация для $SINGBOX_PACKAGE успешно проверена"
-  SINGBOX_UCI_CONFIG_ERROR="Ошибка валидации UCI конфигурации для $SINGBOX_PACKAGE. Проверьте $SINGBOX_CONFIG_PATH"
-  SINGBOX_CONFIG_OK="Конфигурация $SINGBOX_PACKAGE успешно проверена"
-  SINGBOX_CONFIG_ERROR="Ошибка валидации конфигурации $SINGBOX_PACKAGE"
-  SINGBOX_WORKING_TEMPLATE="$SINGBOX_PACKAGE работает. VPN IP: %s"
-  SINGBOX_ROUTING_DOESNT_WORK="$SINGBOX_PACKAGE: Ваш трафик не идёт через VPN. Проверьте конфигурацию: https://cli.co/Badmn3K"
-  TUN2SOCKS_INSTALLED="$TUN2SOCKS_PACKAGE $INSTALLED"
-  TUN2SOCKS_ROUTING_TABLE_EXISTS="Таблица маршрутизации $TUN2SOCKS_PROTOCOL $EXISTS"
-  TUN2SOCKS_ROUTING_TABLE_DOESNT_EXIST="Таблица маршрутизации $TUN2SOCKS_PROTOCOL $DOESNT_EXIST. Подробности: https://cli.co/n7xAbc1"
-  TUN2SOCKS_WORKING_TEMPLATE="$TUN2SOCKS_PACKAGE работает. VPN IP: %s"
-  TUN2SOCKS_ROUTING_DOESNT_WORK="$TUN2SOCKS_PACKAGE: Ваш трафик не идёт через VPN. Проверьте конфигурацию: https://cli.co/VNZISEM"
-  VPN_DOMAINS_SET_EXISTS="vpn_domains set $EXISTS"
-  VPN_DOMAINS_SET_DOESNT_EXIST="vpn_domains set $DOESNT_EXIST"
-  IPS_IN_VPN_DOMAINS_SET_OK="IP-адреса успешно добавлены в vpn_domains set"
-  IPS_IN_VPN_DOMAINS_SET_ERROR="IP-адреса не добавлены в vpn_domains set"
-  VPN_DOMAINS_DETAILS="Если вы не используете vpn_domains, все в порядке.\nНо если вы хотите использовать его, проверьте конфигурацию и выполните: service getdomains start"
-  VPN_DOMAINS_DETAILS_2="Если вы не используете vpn_domains, все в порядке.\nНо если вы хотите использовать, проверьте конфигурацию: https://cli.co/AwUGeM6"
-  VPN_IP_SET_EXISTS="vpn_ip set $EXISTS"
-  VPN_IP_SET_DOESNT_EXIST="vpn_ip set $DOESNT_EXIST"
-  IPS_IN_VPN_IP_SET_OK="IP-адреса успешно добавлены в set vpn_ip"
-  IPS_IN_VPN_IP_SET_ERROR="IP-адреса не добавлены в set vpn_ip"
-  VPN_SUBNET_SET_EXISTS="vpn_subnets set $EXISTS"
-  VPN_SUBNET_SET_DOESNT_EXIST="vpn_subnets set $DOESNT_EXIST"
-  IPS_IN_VPN_SUBNET_SET_OK="IP-адреса успешно добавлены в set vpn_subnets"
-  IPS_IN_VPN_SUBNET_SET_ERROR="IP-адреса не добавлены в set vpn_subnets"
-  VPN_COMMUNITY_SET_EXISTS="vpn_community set $EXISTS"
-  VPN_COMMUNITY_SET_DOESNT_EXIST="vpn_community set $DOESNT_EXIST"
-  IPS_IN_VPN_COMMUNITY_SET_OK="IP-адреса успешно добавлены в set vpn_community"
-  IPS_IN_VPN_COMMUNITY_SET_ERROR="IP-адреса не добавлены в set vpn_community"
-  GETDOMAINS_SCRIPT_EXISTS="Скрипт $GETDOMAINS_SCRIPT_FILENAME $EXISTS"
-  GETDOMAINS_SCRIPT_DOESNT_EXIST="Скрипт $GETDOMAINS_SCRIPT_FILENAME $DOESNT_EXIST"
-  GETDOMAINS_SCRIPT_CRONTAB_OK="Скрипт $GETDOMAINS_SCRIPT_FILENAME успешно добавлен в crontab"
-  GETDOMAINS_SCRIPT_CRONTAB_ERROR="Скрипт $GETDOMAINS_SCRIPT_FILENAME не был добавлен в crontab. Проверьте: crontab -l"
-  DNSCRYPT_INSTALLED="$DNSCRYPT_PACKAGE $INSTALLED"
-  DNSCRYPT_SERVICE_RUNNING="Сервис $DNSCRYPT_PACKAGE $RUNNING"
-  DNSCRYPT_SERVICE_NOT_RUNNING="Сервис $DNSCRYPT_PACKAGE $NOT_RUNNING. Проверьте конфигурацию: https://cli.co/wN-tc_S"
-  DNSMASQ_CONFIG_FOR_DNSCRYPT_OK="Конфигурация $DNSMASQ_PACKAGE для $DNSCRYPT_PACKAGE в порядке"
-  DNSMASQ_CONFIG_FOR_DNSCRYPT_ERROR="Конфигурация $DNSMASQ_PACKAGE для $DNSCRYPT_PACKAGE не в порядке. Проверьте конфигурацию: https://cli.co/rooc0uz"
-  STUBBY_INSTALLED="$STUBBY_PACKAGE $INSTALLED"
-  STUBBY_SERVICE_RUNNING="Сервис $STUBBY_PACKAGE $RUNNING"
-  STUBBY_SERVICE_NOT_RUNNING="Сервис $STUBBY_PACKAGE $NOT_RUNNING. Проверьте конфигурацию: https://cli.co/HbDBT2V"
-  DNSMASQ_CONFIG_FOR_STUBBY_OK="Конфигурация $DNSMASQ_PACKAGE для $STUBBY_PACKAGE в порядке"
-  DNSMASQ_CONFIG_FOR_STUBBY_ERROR="Конфигурация $DNSMASQ_PACKAGE для $STUBBY_PACKAGE не в порядке. Проверьте конфигурацию: https://cli.co/HbDBT2V"
-  DUMP_CREATION="Создание дампа без приватных переменных"
-  DUMP_DETAILS="Дамп находится здесь: $DUMP_PATH\nДля загрузки на Linux/Mac используйте: scp root@IP_ROUTER:$DUMP_PATH .\nДля Windows используйте WinSCP/PSCP или WSL"
-  DNS_CHECK="Проверка DNS серверов"
-  IS_DNS_TRAFFIC_BLOCKED="Проверяем блокировку DNS трафика (Порт 53/udp доступен)"
-  IS_DOH_AVAILABLE="Проверяем доступность DoH"
-  RESPONSE_NOT_CONTAINS_127_0_0_8="Проверяем, что ответ на запрос не содержит адреса из 127.0.0.8"
-  ONE_IP_FOR_TWO_DOMAINS="Проверяем IP для двух разных доменов"
-  IPS_ARE_THE_SAME="IP совпадают"
-  IPS_ARE_DIFFERENT="IP различаются"
-  RESPONSE_IS_NOT_BLANK="Проверяем, что ответ не пустой"
-  DNS_POISONING_CHECK="Сравниваем ответ от незащищенного DNS и DoH (Подмена DNS)"
-  TELEGRAM_CHANNEL="Telegram канал"
-  TELEGRAM_CHAT="Telegram чат"
-}
-
-# -----------------------------
-# Args
-# -----------------------------
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --lang)
-      if [ -n "$2" ]; then
-        LANGUAGE="$2"
-        shift 2
-      else
-        printf "$COLOR_BOLD_RED[ERROR]$COLOR_RESET Missing value for --lang\n"
-        exit 1
-      fi
-      ;;
-    dump|dns)
-      COMMAND="$1"
-      shift
-      ;;
-    *)
-      printf "$COLOR_BOLD_RED[ERROR]$COLOR_RESET Unknown option: %s\n" "$1"
-      exit 1
-      ;;
-  esac
-done
-
-case "$LANGUAGE" in
-  ru)
-    set_language_ru
-    ;;
-  en)
-    set_language_en
-    ;;
-  *)
-    printf "$COLOR_BOLD_RED[ERROR]$COLOR_RESET Unsupported language '%s'. Supported languages: %s\n" "$LANGUAGE" "$SUPPORTED_LANGUAGES"
-    exit 1
-    ;;
-esac
-
-# -----------------------------
-# System details
-# -----------------------------
-
-MODEL="$(cat /tmp/sysinfo/model 2>/dev/null)"
-get_openwrt_release
-
-printf "$COLOR_BOLD_BLUE$DEVICE_MODEL: $MODEL$COLOR_RESET\n"
-printf "$COLOR_BOLD_BLUE$OPENWRT_VERSION: $OPENWRT_RELEASE$COLOR_RESET\n"
-printf "$COLOR_BOLD_BLUE$CURRENT_DATE: $(date)$COLOR_RESET\n"
-
-VERSION_ID="$(echo "$OPENWRT_RELEASE" | awk -F. '{print $1}')"
-RAM="$(free -m 2>/dev/null | awk '/^Mem:/ {print $2}')"
-
-if [ -n "$VERSION_ID" ] && [ -n "$RAM" ] && [ "$VERSION_ID" -ge 22 ] && [ "$RAM" -lt "$MIN_RAM" ]; then
-  echo "$RAM_WARNING"
-fi
-
-# -----------------------------
-# Check packages
-# -----------------------------
-
-if command_exists curl || package_installed "$CURL_PACKAGE"; then
-  CURL=1
-  checkpoint_true "$CURL_INSTALLED"
-else
-  CURL=0
-  checkpoint_false "$CURL_NOT_INSTALLED"
-fi
-
-DNSMASQ_VERSION="$(get_dnsmasq_full_version)"
-if [ -n "$DNSMASQ_VERSION" ] && version_ge "$DNSMASQ_VERSION" "$DNSMASQ_FULL_REQUIRED_VERSION"; then
-  checkpoint_true "$DNSMASQ_FULL_INSTALLED"
-else
-  checkpoint_false "$DNSMASQ_FULL_NOT_INSTALLED"
-  printf "$DNSMASQ_FULL_DETAILS\n"
-  if [ "$VERSION_ID" = "21" ]; then
-    printf "$OPENWRT_21_DETAILS\n"
-  fi
-fi
-
-# Check xray packages
-if package_installed "$XRAY_CORE_PACKAGE"; then
-  checkpoint_false "$XRAY_CORE_PACKAGE_DETECTED"
-fi
-
-if package_installed "$LUCI_APP_XRAY_PACKAGE"; then
-  checkpoint_false "$LUCI_APP_XRAY_PACKAGE_DETECTED"
-fi
-
-# -----------------------------
-# Check dnsmasq
-# -----------------------------
-
-if service_running "$DNSMASQ_PACKAGE"; then
-  checkpoint_true "$DNSMASQ_SERVICE_RUNNING"
-else
-  checkpoint_false "$DNSMASQ_SERVICE_NOT_RUNNING"
-  output_21
-fi
-
-# -----------------------------
-# Check internet connection
-# -----------------------------
-
-if [ "$CURL" -ge 1 ] && curl -k -I -s --connect-timeout 5 https://community.antifilter.download/ 2>/dev/null | grep -q "200"; then
-  checkpoint_true "$INTERNET_IS_AVAILABLE"
-else
-  checkpoint_false "$INTERNET_IS_NOT_AVAILABLE"
-  if [ "$CURL" -lt 1 ]; then
-    echo "$CURL_NOT_INSTALLED"
-  else
-    printf "$INTERNET_DETAILS\n"
-  fi
-fi
-
-# -----------------------------
-# Check IPv6
-# -----------------------------
-
-if [ "$CURL" -ge 1 ] && curl -6 -s --connect-timeout 5 https://ifconfig.io 2>/dev/null | grep -Eq '([0-9a-fA-F]{0,4}:){2,}'; then
-  checkpoint_false "$IPV6_DETECTED"
-fi
-
-# -----------------------------
-# Tunnels
-# -----------------------------
-
-WG=false
-OVPN=false
-
-if package_installed "$WIREGUARD_TOOLS_PACKAGE"; then
-  checkpoint_true "$WIREGUARD_TOOLS_INSTALLED"
-  WG=true
-fi
-
-if [ "$WG" = "true" ]; then
-  if ping -c 1 -q -I wg0 itdog.info 2>/dev/null | grep -Eq "1 packets received|1 received"; then
-    checkpoint_true "$WIREGUARD_PROTOCOL"
-  else
-    checkpoint_false "$WIREGUARD_PROTOCOL"
-
-    WG_TRACE="$(traceroute -i wg0 itdog.info -m 1 2>/dev/null | awk '/ ms/ {print $2}' | grep -c -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')"
-    if [ "$WG_TRACE" -ge 1 ]; then
-      echo "$WIREGUARD_ROUTING_DOESNT_WORK"
-    else
-      printf "$WIREGUARD_TUNNEL_NOT_WORKING\n"
-    fi
-  fi
-
-  # Check WG route_allowed_ips
-  if uci show network 2>/dev/null | grep -q ".route_allowed_ips='1'"; then
-    checkpoint_false "$WIREGUARD_ROUTE_ALLOWED_IPS_ENABLED"
-  else
-    checkpoint_true "$WIREGUARD_ROUTE_ALLOWED_IPS_DISABLED"
-  fi
-
-  # Check route table
-  if route_table_has_default_dev vpn wg0; then
-    checkpoint_true "$WIREGUARD_ROUTING_TABLE_EXISTS"
-  else
-    checkpoint_false "$WIREGUARD_ROUTING_TABLE_DOESNT_EXIST"
-  fi
-fi
-
-if package_installed "$OPENVPN_PACKAGE"; then
-  checkpoint_true "$OPENVPN_INSTALLED"
-  OVPN=true
-fi
-
-# Check OpenVPN
-if [ "$OVPN" = "true" ]; then
-  if ping -c 1 -q -I tun0 itdog.info 2>/dev/null | grep -Eq "1 packets received|1 received"; then
-    checkpoint_true "$OPENVPN_PROTOCOL"
-  else
-    checkpoint_false "$OPENVPN_PROTOCOL"
-
-    if traceroute -i tun0 itdog.info -m 1 2>/dev/null | awk '/ ms/ {print $2}' | grep -q -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-      echo "$OPENVPN_ROUTING_DOESNT_WORK"
-    else
-      echo "$OPENVPN_TUNNEL_NOT_WORKING"
-    fi
-  fi
-
-  # Check OpenVPN redirect-gateway
-  if ls /etc/openvpn/* >/dev/null 2>&1 && grep -q "redirect-gateway" /etc/openvpn/* 2>/dev/null; then
-    checkpoint_false "$OPENVPN_REDIRECT_GATEWAY_ENABLED"
-  else
-    checkpoint_true "$OPENVPN_REDIRECT_GATEWAY_DISABLED"
-  fi
-
-  # Check route table
-  if route_table_has_default_dev vpn tun0; then
-    checkpoint_true "$OPENVPN_ROUTING_TABLE_EXISTS"
-  else
-    checkpoint_false "$OPENVPN_ROUTING_TABLE_DOESNT_EXIST"
-  fi
-fi
-
-# -----------------------------
-# sing-box
-# -----------------------------
-
-if package_installed "$SINGBOX_PACKAGE"; then
-  checkpoint_true "$SINGBOX_INSTALLED"
-
-  # Check route table (tun0 or any default in vpn table)
-  if route_table_has_default_dev vpn tun0 || route_table_has_any_default vpn; then
-    checkpoint_true "$SINGBOX_ROUTING_TABLE_EXISTS"
-  else
-    checkpoint_false "$SINGBOX_ROUTING_TABLE_DOESNT_EXIST"
-  fi
-
-  # UCI validation
-  if uci show sing-box 2>&1 | grep -q "Parse error"; then
-    checkpoint_false "$SINGBOX_UCI_CONFIG_ERROR"
-  else
-    checkpoint_true "$SINGBOX_UCI_CONFIG_OK"
-  fi
-
-  if [ -f "$SINGBOX_JSON_CONFIG" ]; then
-    if sing-box check -c "$SINGBOX_JSON_CONFIG" >/dev/null 2>&1; then
-      checkpoint_true "$SINGBOX_CONFIG_OK"
-
-      IP_EXTERNAL="$(get_external_ip)"
-      IP_VPN="$(get_external_ip_via_iface tun0)"
-
-      if [ -n "$IP_EXTERNAL" ] && [ -n "$IP_VPN" ]; then
-        SINGBOX_WORKING="$(update_vpn_ip "$SINGBOX_WORKING_TEMPLATE" "$IP_VPN")"
-
-        if [ "$IP_EXTERNAL" != "$IP_VPN" ]; then
-          checkpoint_true "$SINGBOX_WORKING"
-        else
-          checkpoint_false "$SINGBOX_ROUTING_DOESNT_WORK"
+lock() {
+    if [ -e "$LOCK_FILE" ]; then
+        oldpid="$(cat "$LOCK_FILE" 2>/dev/null || true)"
+        if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+            fail "another instance already running (pid $oldpid)"
         fi
-      else
-        checkpoint_false "$SINGBOX_ROUTING_DOESNT_WORK"
-      fi
-    else
-      checkpoint_false "$SINGBOX_CONFIG_ERROR"
-      sing-box check -c "$SINGBOX_JSON_CONFIG"
-    fi
-  else
-    checkpoint_false "$SINGBOX_CONFIG_ERROR"
-    echo "File not found: $SINGBOX_JSON_CONFIG"
-  fi
-fi
-
-# -----------------------------
-# tun2socks
-# -----------------------------
-
-if command_exists tun2socks; then
-  checkpoint_true "$TUN2SOCKS_INSTALLED"
-
-  # Check route table
-  if route_table_has_default_dev vpn tun0 || route_table_has_any_default vpn; then
-    checkpoint_true "$TUN2SOCKS_ROUTING_TABLE_EXISTS"
-  else
-    checkpoint_false "$TUN2SOCKS_ROUTING_TABLE_DOESNT_EXIST"
-  fi
-
-  IP_EXTERNAL="$(get_external_ip)"
-  IP_VPN="$(get_external_ip_via_iface tun0)"
-
-  if [ -n "$IP_EXTERNAL" ] && [ -n "$IP_VPN" ]; then
-    TUN2SOCKS_WORKING="$(update_vpn_ip "$TUN2SOCKS_WORKING_TEMPLATE" "$IP_VPN")"
-
-    if [ "$IP_EXTERNAL" != "$IP_VPN" ]; then
-      checkpoint_true "$TUN2SOCKS_WORKING"
-    else
-      checkpoint_false "$TUN2SOCKS_ROUTING_DOESNT_WORK"
-    fi
-  else
-    checkpoint_false "$TUN2SOCKS_ROUTING_DOESNT_WORK"
-  fi
-fi
-
-# -----------------------------
-# Check sets
-# -----------------------------
-
-# vpn_domains set
-vpn_domain_ipset_id="$(uci show firewall 2>/dev/null | grep -E '@ipset.*vpn_domains' | awk -F '[][{}]' '{print $2}' | head -n 1)"
-vpn_domain_ipset_string=0
-if [ -n "$vpn_domain_ipset_id" ]; then
-  vpn_domain_ipset_string="$(uci show firewall.@ipset["$vpn_domain_ipset_id"] 2>/dev/null | grep -c "name='vpn_domains'\|match='dst_net'")"
-fi
-
-vpn_domain_rule_id="$(uci show firewall 2>/dev/null | grep -E '@rule.*vpn_domains' | awk -F '[][{}]' '{print $2}' | head -n 1)"
-vpn_domain_rule_string=0
-if [ -n "$vpn_domain_rule_id" ]; then
-  vpn_domain_rule_string="$(uci show firewall.@rule["$vpn_domain_rule_id"] 2>/dev/null | grep -c "name='mark_domains'\|src='lan'\|dest='\*'\|proto='all'\|ipset='vpn_domains'\|set_mark='0x1'\|target='MARK'\|family='ipv4'")"
-fi
-
-if [ $((vpn_domain_ipset_string + vpn_domain_rule_string)) -eq 10 ]; then
-  checkpoint_true "$VPN_DOMAINS_SET_EXISTS"
-
-  # force resolve for vpn_domains
-  nslookup terraform.io 127.0.0.1 >/dev/null 2>&1
-  nslookup pochta.ru 127.0.0.1 >/dev/null 2>&1
-  nslookup 2gis.ru 127.0.0.1 >/dev/null 2>&1
-
-  VPN_DOMAINS_IP="$(nft list ruleset 2>/dev/null | grep -A 10 vpn_domains | grep -c -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')"
-  if [ "$VPN_DOMAINS_IP" -ge 1 ]; then
-    checkpoint_true "$IPS_IN_VPN_DOMAINS_SET_OK"
-  else
-    checkpoint_false "$IPS_IN_VPN_DOMAINS_SET_ERROR"
-    printf "$VPN_DOMAINS_DETAILS\n"
-    output_21
-  fi
-else
-  checkpoint_false "$VPN_DOMAINS_SET_DOESNT_EXIST"
-  printf "$VPN_DOMAINS_DETAILS_2\n"
-fi
-
-# vpn_ip set
-vpn_ip_ipset_id="$(uci show firewall 2>/dev/null | grep -E '@ipset.*vpn_ip' | awk -F '[][{}]' '{print $2}' | head -n 1)"
-vpn_ip_ipset_string=0
-if [ -n "$vpn_ip_ipset_id" ]; then
-  vpn_ip_ipset_string="$(uci show firewall.@ipset["$vpn_ip_ipset_id"] 2>/dev/null | grep -c "name='vpn_ip'\|match='dst_net'\|loadfile='/tmp/lst/ip.lst'")"
-fi
-
-vpn_ip_rule_id="$(uci show firewall 2>/dev/null | grep -E '@rule.*vpn_ip' | awk -F '[][{}]' '{print $2}' | head -n 1)"
-vpn_ip_rule_string=0
-if [ -n "$vpn_ip_rule_id" ]; then
-  vpn_ip_rule_string="$(uci show firewall.@rule["$vpn_ip_rule_id"] 2>/dev/null | grep -c "name='mark_ip'\|src='lan'\|dest='\*'\|proto='all'\|ipset='vpn_ip'\|set_mark='0x1'\|target='MARK'\|family='ipv4'")"
-fi
-
-if [ $((vpn_ip_ipset_string + vpn_ip_rule_string)) -eq 11 ]; then
-  checkpoint_true "$VPN_IP_SET_EXISTS"
-  VPN_IP_IP="$(nft list ruleset 2>/dev/null | grep -A 10 vpn_ip | grep -c -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')"
-  if [ "$VPN_IP_IP" -ge 1 ]; then
-    checkpoint_true "$IPS_IN_VPN_IP_SET_OK"
-  else
-    checkpoint_false "$IPS_IN_VPN_IP_SET_ERROR"
-    output_21
-  fi
-elif uci show firewall 2>/dev/null | grep -q "vpn_ip"; then
-  checkpoint_false "$VPN_IP_SET_DOESNT_EXIST"
-fi
-
-# vpn_subnets set
-vpn_subnet_ipset_id="$(uci show firewall 2>/dev/null | grep -E '@ipset.*vpn_subnet' | awk -F '[][{}]' '{print $2}' | head -n 1)"
-vpn_subnet_ipset_string=0
-if [ -n "$vpn_subnet_ipset_id" ]; then
-  vpn_subnet_ipset_string="$(uci show firewall.@ipset["$vpn_subnet_ipset_id"] 2>/dev/null | grep -c "name='vpn_subnets'\|match='dst_net'\|loadfile='/tmp/lst/subnet.lst'")"
-fi
-
-vpn_subnet_rule_id="$(uci show firewall 2>/dev/null | grep -E '@rule.*vpn_subnet' | awk -F '[][{}]' '{print $2}' | head -n 1)"
-vpn_subnet_rule_string=0
-if [ -n "$vpn_subnet_rule_id" ]; then
-  vpn_subnet_rule_string="$(uci show firewall.@rule["$vpn_subnet_rule_id"] 2>/dev/null | grep -c "name='mark_subnet'\|src='lan'\|dest='\*'\|proto='all'\|ipset='vpn_subnets'\|set_mark='0x1'\|target='MARK'\|family='ipv4'")"
-fi
-
-if [ $((vpn_subnet_ipset_string + vpn_subnet_rule_string)) -eq 11 ]; then
-  checkpoint_true "$VPN_SUBNET_SET_EXISTS"
-  VPN_IP_SUBNET="$(nft list ruleset 2>/dev/null | grep -A 10 vpn_subnet | grep -c -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')"
-  if [ "$VPN_IP_SUBNET" -ge 1 ]; then
-    checkpoint_true "$IPS_IN_VPN_SUBNET_SET_OK"
-  else
-    checkpoint_false "$IPS_IN_VPN_SUBNET_SET_ERROR"
-    output_21
-  fi
-elif uci show firewall 2>/dev/null | grep -q "vpn_subnet"; then
-  checkpoint_false "$VPN_SUBNET_SET_DOESNT_EXIST"
-fi
-
-# vpn_community set
-vpn_community_ipset_id="$(uci show firewall 2>/dev/null | grep -E '@ipset.*vpn_community' | awk -F '[][{}]' '{print $2}' | head -n 1)"
-vpn_community_ipset_string=0
-if [ -n "$vpn_community_ipset_id" ]; then
-  vpn_community_ipset_string="$(uci show firewall.@ipset["$vpn_community_ipset_id"] 2>/dev/null | grep -c "name='vpn_community'\|match='dst_net'\|loadfile='/tmp/lst/community.lst'")"
-fi
-
-vpn_community_rule_id="$(uci show firewall 2>/dev/null | grep -E '@rule.*vpn_community' | awk -F '[][{}]' '{print $2}' | head -n 1)"
-vpn_community_rule_string=0
-if [ -n "$vpn_community_rule_id" ]; then
-  vpn_community_rule_string="$(uci show firewall.@rule["$vpn_community_rule_id"] 2>/dev/null | grep -c "name='mark_community'\|src='lan'\|dest='\*'\|proto='all'\|ipset='vpn_community'\|set_mark='0x1'\|target='MARK'\|family='ipv4'")"
-fi
-
-if [ $((vpn_community_ipset_string + vpn_community_rule_string)) -eq 11 ]; then
-  checkpoint_true "$VPN_COMMUNITY_SET_EXISTS"
-  VPN_COMMUNITY_IP="$(nft list ruleset 2>/dev/null | grep -A 10 vpn_community | grep -c -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+')"
-  if [ "$VPN_COMMUNITY_IP" -ge 1 ]; then
-    checkpoint_true "$IPS_IN_VPN_COMMUNITY_SET_OK"
-  else
-    checkpoint_false "$IPS_IN_VPN_COMMUNITY_SET_ERROR"
-    output_21
-  fi
-elif uci show firewall 2>/dev/null | grep -q "vpn_community"; then
-  checkpoint_false "$VPN_COMMUNITY_SET_DOESNT_EXIST"
-fi
-
-# -----------------------------
-# getdomains script
-# -----------------------------
-
-if [ -s "$GETDOMAINS_SCRIPT_PATH" ]; then
-  checkpoint_true "$GETDOMAINS_SCRIPT_EXISTS"
-  if safe_crontab_has "$GETDOMAINS_SCRIPT_PATH"; then
-    checkpoint_true "$GETDOMAINS_SCRIPT_CRONTAB_OK"
-  else
-    checkpoint_false "$GETDOMAINS_SCRIPT_CRONTAB_ERROR"
-  fi
-else
-  checkpoint_false "$GETDOMAINS_SCRIPT_DOESNT_EXIST"
-fi
-
-# -----------------------------
-# DNS
-# -----------------------------
-
-# DNSCrypt
-if package_installed "$DNSCRYPT_PACKAGE"; then
-  checkpoint_true "$DNSCRYPT_INSTALLED"
-  if service_running "dnscrypt-proxy"; then
-    checkpoint_true "$DNSCRYPT_SERVICE_RUNNING"
-  else
-    checkpoint_false "$DNSCRYPT_SERVICE_NOT_RUNNING"
-    output_21
-  fi
-
-  DNSMASQ_STRING="$(uci show dhcp.@dnsmasq[0] 2>/dev/null | grep -c "127.0.0.53#53\|noresolv='1'")"
-  if [ "$DNSMASQ_STRING" -eq 2 ]; then
-    checkpoint_true "$DNSMASQ_CONFIG_FOR_DNSCRYPT_OK"
-  else
-    checkpoint_false "$DNSMASQ_CONFIG_FOR_DNSCRYPT_ERROR"
-  fi
-fi
-
-# Stubby
-if package_installed "$STUBBY_PACKAGE"; then
-  checkpoint_true "$STUBBY_INSTALLED"
-  if service_running "stubby"; then
-    checkpoint_true "$STUBBY_SERVICE_RUNNING"
-  else
-    checkpoint_false "$STUBBY_SERVICE_NOT_RUNNING"
-    output_21
-  fi
-
-  STUBBY_STRING="$(uci show dhcp.@dnsmasq[0] 2>/dev/null | grep -c "127.0.0.1#5453\|noresolv='1'")"
-  if [ "$STUBBY_STRING" -eq 2 ]; then
-    checkpoint_true "$DNSMASQ_CONFIG_FOR_STUBBY_OK"
-  else
-    checkpoint_false "$DNSMASQ_CONFIG_FOR_STUBBY_ERROR"
-  fi
-fi
-
-# -----------------------------
-# Extra commands
-# -----------------------------
-
-case "$COMMAND" in
-  dump)
-    printf "\n$COLOR_BOLD_CYAN$DUMP_CREATION$COLOR_RESET\n"
-
-    date >"$DUMP_PATH"
-
-    if [ -x "$HIVPN_SCRIPT_PATH" ]; then
-      "$HIVPN_SCRIPT_PATH" start >>"$DUMP_PATH" 2>&1
     fi
 
-    if [ -x "$GETDOMAINS_SCRIPT_PATH" ]; then
-      "$GETDOMAINS_SCRIPT_PATH" start >>"$DUMP_PATH" 2>&1
-    fi
+    echo $$ > "$LOCK_FILE"
+    trap 'rm -f "$LOCK_FILE" "$TMP_FILE"' EXIT INT TERM
+}
 
-    uci show firewall >>"$DUMP_PATH" 2>/dev/null
-    uci show network 2>/dev/null \
-      | sed -r "s/(.*private_key=|.*preshared_key=|.*public_key=|.*endpoint_host=|.*wan.ipaddr=|.*wan.netmask=|.*wan.gateway=|.*wan.dns=|.*\.macaddr=).*/\1REMOVED/" \
-      >>"$DUMP_PATH"
+start_main() {
+    lock
 
-    printf "$DUMP_DETAILS\n"
-    ;;
-  dns)
-    printf "\n$COLOR_BOLD_CYAN$DNS_CHECK$COLOR_RESET\n"
+    require_cmd nft
+    require_cmd ip
+    require_cmd nslookup
 
-    DNS_SERVERS="1.1.1.1 8.8.8.8 8.8.4.4"
-    DOH_DNS_SERVERS="cloudflare-dns.com 1.1.1.1 mozilla.cloudflare-dns.com security.cloudflare-dns.com"
-    DOMAINS="instagram.com facebook.com"
+    ensure_nft_set
+    ensure_mark_rules
+    ensure_ip_rule
+    ensure_route_table
+    resolve_all_domains
+    load_ips_to_nft
 
-    echo "1. $IS_DNS_TRAFFIC_BLOCKED"
+    log "done"
+}
 
-    for i in $DNS_SERVERS; do
-      if nslookup -type=a -timeout=2 -retry=1 itdog.info "$i" 2>/dev/null | grep -q "timed out"; then
-        checkpoint_false "$i"
-      else
-        checkpoint_true "$i"
-      fi
-    done
+flush_main() {
+    nft list set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET4" >/dev/null 2>&1 && nft flush set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET4" >/dev/null 2>&1
+    log "nft set flushed"
+}
 
-    echo "2. $IS_DOH_AVAILABLE"
+status_main() {
+    echo "=== nft set ==="
+    nft list set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET4" 2>/dev/null || echo "set not found"
 
-    for i in $DOH_DNS_SERVERS; do
-      if [ "$CURL" -ge 1 ] && curl --connect-timeout 5 -s -H "accept: application/dns-json" "https://$i/dns-query?name=itdog.info&type=A" 2>/dev/null \
-        | grep -oE '"data":"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' >/dev/null; then
-        checkpoint_true "$i"
-      else
-        checkpoint_false "$i"
-      fi
-    done
+    echo
+    echo "=== nft mark rules ==="
+    nft list chain inet fw4 mangle_prerouting 2>/dev/null | grep "wg-domain-routing" || true
+    nft list chain inet fw4 mangle_output 2>/dev/null | grep "wg-domain-routing" || true
 
-    echo "3. $RESPONSE_NOT_CONTAINS_127_0_0_8"
+    echo
+    echo "=== ip rule ==="
+    ip rule show | grep "lookup $ROUTE_TABLE" || echo "ip rule not found"
 
-    for i in $DOMAINS; do
-      if get_first_ipv4_from_nslookup "$i" | grep -q -E '^127\.[0-9]{1,3}\.'; then
-        checkpoint_false "$i"
-      else
-        checkpoint_true "$i"
-      fi
-    done
+    echo
+    echo "=== table $ROUTE_TABLE ==="
+    ip route show table "$ROUTE_TABLE" || echo "route table empty"
+}
 
-    echo "4. $ONE_IP_FOR_TWO_DOMAINS"
-
-    FIRSTIP="$(get_first_ipv4_from_nslookup instagram.com)"
-    SECONDIP="$(get_first_ipv4_from_nslookup facebook.com)"
-
-    if [ -n "$FIRSTIP" ] && [ "$FIRSTIP" = "$SECONDIP" ]; then
-      checkpoint_false "$IPS_ARE_THE_SAME"
-    else
-      checkpoint_true "$IPS_ARE_DIFFERENT"
-    fi
-
-    echo "5. $RESPONSE_IS_NOT_BLANK"
-
-    for i in $DOMAINS; do
-      if get_first_ipv4_from_nslookup "$i" | grep -q -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-        checkpoint_true "$i"
-      else
-        checkpoint_false "$i"
-      fi
-    done
-
-    echo "6. $DNS_POISONING_CHECK"
-
-    if [ "$CURL" -ge 1 ]; then
-      DOHIP="$(curl -s --connect-timeout 5 -H "accept: application/dns-json" "https://1.1.1.1/dns-query?name=facebook.com&type=A" 2>/dev/null \
-        | grep -oE '"data":"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"' \
-        | head -n1 \
-        | sed 's/"data":"//; s/"//')"
-    else
-      DOHIP=""
-    fi
-
-    OPENIP="$(get_first_ipv4_from_nslookup facebook.com 1.1.1.1)"
-
-    if [ -n "$DOHIP" ] && [ "$DOHIP" = "$OPENIP" ]; then
-      checkpoint_true "$IPS_ARE_THE_SAME"
-    else
-      checkpoint_false "$IPS_ARE_DIFFERENT"
-    fi
-    ;;
-  *)
-    ;;
+case "$1" in
+    start|reload|restart)
+        start_main
+        ;;
+    flush)
+        flush_main
+        ;;
+    status)
+        status_main
+        ;;
+    *)
+        echo "Usage: $0 {start|reload|restart|flush|status}"
+        exit 1
+        ;;
 esac
+EOF
 
-# -----------------------------
-# Info
-# -----------------------------
+    chmod +x "$BIN_SCRIPT"
+    ok "Создан $BIN_SCRIPT"
+}
 
-echo
-echo "$TELEGRAM_CHANNEL: https://t.me/itdoginfo"
-echo "$TELEGRAM_CHAT: https://t.me/itdogchat"
+create_init_script() {
+    cat > "$INIT_SCRIPT" << 'EOF'
+#!/bin/sh /etc/rc.common
+
+START=99
+USE_PROCD=1
+
+start_service() {
+    /usr/bin/getdomains-wg start
+}
+
+reload_service() {
+    /usr/bin/getdomains-wg reload
+}
+
+service_triggers() {
+    procd_add_reload_trigger network firewall
+}
+EOF
+
+    chmod +x "$INIT_SCRIPT"
+    /etc/init.d/getdomains-wg enable
+    ok "Создан и включен $INIT_SCRIPT"
+}
+
+create_hotplug_script() {
+    mkdir -p /etc/hotplug.d/iface
+
+    cat > "$HOTPLUG_SCRIPT" << 'EOF'
+#!/bin/sh
+
+[ "$ACTION" = "ifup" ] || exit 0
+[ "$INTERFACE" = "wg0" ] || exit 0
+
+logger -t getdomains-wg-hotplug "wg0 is up, refreshing domain routes"
+/usr/bin/getdomains-wg reload
+EOF
+
+    chmod +x "$HOTPLUG_SCRIPT"
+    ok "Создан $HOTPLUG_SCRIPT"
+}
+
+setup_cron() {
+    grep -q "/usr/bin/getdomains-wg reload" "$CRON_FILE" 2>/dev/null || echo "*/30 * * * * /usr/bin/getdomains-wg reload >/dev/null 2>&1" >> "$CRON_FILE"
+    /etc/init.d/cron restart
+    ok "Добавлен cron на обновление каждые 30 минут"
+}
+
+ensure_firewall_ready() {
+    /etc/init.d/firewall enabled >/dev/null 2>&1 || true
+    /etc/init.d/firewall restart
+    ok "fw4/firewall перезапущен"
+}
+
+run_initial_start() {
+    /etc/init.d/getdomains-wg start || die "Не удалось запустить getdomains-wg"
+    ok "Первичный запуск выполнен"
+}
+
+show_status() {
+    echo
+    info "Проверка статуса:"
+    /usr/bin/getdomains-wg status || true
+}
+
+main() {
+    info "Установка selective domain routing для WireGuard на OpenWrt 25.12.1+"
+    check_prereqs
+    create_dirs_and_files
+    create_getdomains_script
+    create_init_script
+    create_hotplug_script
+    setup_cron
+    ensure_firewall_ready
+    run_initial_start
+    show_status
+
+    echo
+    ok "Готово."
+    echo
+    echo "Файл доменов: $DOMAINS_FILE"
+    echo "Редактировать список доменов:"
+    echo "  vi $DOMAINS_FILE"
+    echo
+    echo "Обновить вручную:"
+    echo "  /usr/bin/getdomains-wg reload"
+    echo
+    echo "Статус:"
+    echo "  /usr/bin/getdomains-wg status"
+    echo
+    echo "Если WG интерфейс НЕ wg0 — правь WG_IF в:"
+    echo "  $BIN_SCRIPT"
+    echo "  $HOTPLUG_SCRIPT"
+}
+
+main "$@"
